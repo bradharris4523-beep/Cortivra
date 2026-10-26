@@ -1,0 +1,90 @@
+# ==============================================================================
+# CORTIVRA — SECURITY & REPOSITORY HYGIENE SHIELD
+# ==============================================================================
+
+# 1. Secrets, Credentials & Environment Configurations (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+secrets/
+credentials.json
+
+# 2. Proprietary IP & Local Compounding Discovery Vaults (NEVER COMMIT)
+private_vault/
+*.vault.private
+*.proprietary.*
+scratch_experiments/
+
+# 3. Python Bytecode, Packaging & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+
+# 4. Testing, Type Checking & Linting Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# 5. GPU / ML Checkpoints, Heavy Tensors & Temporary Simulation Traces
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+*.h5
+*.hdf5
+*.npz
+wasm_cache/
+runs/
+wandb/
+outputs/
+tmp/
+temp/
+
+# 6. Frontend / Observatory UI Build Artifacts
+node_modules/
+observatory_ui/node_modules/
+observatory_ui/dist/
+observatory_ui/.vite/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 7. OS & IDE Metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
