@@ -15,7 +15,7 @@ flowchart TD
     L5["Layer 5: Proof & Stress Testing (Noise Tests & Rediscovery from Scratch)"]
     L4["Layer 4: GPU Simulation Engine (Fast Filtering & Inverse Gradients)"]
     L3["Layer 3: Math-to-GPU Compiler (Equations + SAM 3.1 Cell Shapes -> GPU Tensors)"]
-    L2["Layer 2: Science Building Blocks (12 Reusable Math Operators & Domain Pods)"]
+    L2["Layer 2: Science Building Blocks (16 Reusable Math Operators & 4 Domain Modules)"]
     L1["Layer 1: Core Rules (Units, Energy/Mass Balance, Safety Limits & Law Vault)"]
 
     L7 <--> L6
@@ -32,7 +32,7 @@ flowchart TD
 | Layer | Folder | What It Does |
 | :--- | :--- | :--- |
 | **Layer 1** | `cortivra/layer1_axioms/` | Checks units, tracks energy, mass, and charge balance, enforces safety limits, and saves proven rules in the Vault. |
-| **Layer 2** | `cortivra/layer2_fabric/` | 12 reusable math building blocks that snap together to model chemistry, ion channels, cells, brain circuits, or mechanics. |
+| **Layer 2** | `cortivra/layer2_fabric/` | 16 reusable math operators and 4 domain modules covering mechanics, electrodynamics, chemical kinetics, and spatial transport. |
 | **Layer 3** | `cortivra/layer3_compiler/` | Takes equations and real cell shapes from **SAM 3.1** and turns them into fast GPU tensors. |
 | **Layer 4** | `cortivra/layer4_engine/` | Tests millions of possibilities in parallel on the GPU, filters out bad states, and uses gradients to find exact solutions. |
 | **Layer 5** | `cortivra/layer5_proof/` | Shakes surviving solutions with noise and stress tests to make sure they are real—including blind tests to rediscover known science from scratch. |

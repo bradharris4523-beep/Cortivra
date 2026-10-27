@@ -51,11 +51,11 @@ Every subsystem in Cortivra is represented through four physical components:
 - **`vault.py`**: Two-tier law registry separating read-only core laws (`CORE_IMMUTABLE`) from quarantined discovered laws (`DISCOVERED_SANDBOX`).
 
 ### Layer 2: `layer2_fabric`
-- **`primitives.py`**: Vectorized PyTorch implementations of the 12 differential primitives.
-- **`molecular_pod.py`**: Biochemical reaction networks, ligand binding, and ATP energetics.
-- **`cellular_pod.py`**: Conductance-based ion channels and intracellular ion dynamics.
-- **`network_pod.py`**: Excitatory/inhibitory spiking circuits, plasticity, and field potentials.
-- **`mechanics_pod.py`**: Coupled nonlinear oscillators for cross-domain verification.
+- **`primitives.py`**: Vectorized PyTorch implementations of the 16 differential primitives across 4 families, plus `PRIMITIVE_REGISTRY`.
+- **`mechanics_and_fields.py`**: `CentralForceHamiltonianBrick` (N-body gravitational / Coulomb / inverse-distance fields) and `NonlinearPendulumAndViscoelasticBrick`.
+- **`electrodynamics_and_circuits.py`**: `NonlinearConductanceCircuitBrick` (capacitive-conductive circuits with voltage-gated Boltzmann channels and Rush-Larsen integration).
+- **`kinetics_and_thermodynamics.py`**: `StoichiometricReactionBrick` (reversible mass-action kinetics and relative-entropy Lyapunov potential) and `CooperativeBindingBrick`.
+- **`transport_and_fields.py`**: `SpatialAdvectionDiffusionBrick` (O(N) matrix-free 1D and sparse graph Laplacian PDE field) and `EventImpulseCouplingBrick`.
 
 ### Layer 3: `layer3_compiler`
 - **`ast_nodes.py`**: Symbolic equation tree representation.
