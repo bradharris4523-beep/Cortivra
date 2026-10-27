@@ -1,8 +1,4 @@
-# ==============================================================================
-# CORTIVRA — SECURITY & REPOSITORY HYGIENE SHIELD
-# ==============================================================================
-
-# 1. Secrets, Credentials & Environment Configurations (NEVER COMMIT)
+# Credentials and environment variables
 .env
 .env.*
 !.env.example
@@ -12,13 +8,13 @@
 secrets/
 credentials.json
 
-# 2. Proprietary IP & Local Compounding Discovery Vaults (NEVER COMMIT)
+# Local discovery vaults and scratch data
 private_vault/
 *.vault.private
 *.proprietary.*
 scratch_experiments/
 
-# 3. Python Bytecode, Packaging & Virtual Environments
+# Python bytecode and virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
@@ -44,15 +40,16 @@ venv/
 ENV/
 env/
 
-# 4. Testing, Type Checking & Linting Caches
+# Test and linter caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
 .coverage
 htmlcov/
 coverage.xml
 
-# 5. GPU / ML Checkpoints, Heavy Tensors & Temporary Simulation Traces
+# Checkpoints and temporary traces
 *.pt
 *.pth
 *.onnx
@@ -68,7 +65,7 @@ outputs/
 tmp/
 temp/
 
-# 6. Frontend / Observatory UI Build Artifacts
+# Frontend build artifacts
 node_modules/
 observatory_ui/node_modules/
 observatory_ui/dist/
@@ -79,7 +76,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# 7. OS & IDE Metadata
+# OS and editor files
 .DS_Store
 Thumbs.db
 Desktop.ini
