@@ -320,6 +320,10 @@ def verify_thermodynamic_laws(
         p_ext = external_power
     elif port_inputs and "external_flow" in port_inputs:
         p_ext = (e * port_inputs["external_flow"]).sum(dim=-1)
+    elif hasattr(brick, "external_drive_power"):
+        p_ext = brick.external_drive_power(state, params)
+    elif hasattr(brick, "external_patch_power"):
+        p_ext = brick.external_patch_power(state, params)
     else:
         p_ext = torch.zeros_like(dh_dt)
     power_balance_err = float(torch.max(torch.abs(dh_dt - (p_ext - dissipated))).item())
@@ -561,7 +565,7 @@ def analyze_unexplained_residual(
             ss_tot = torch.sum((y - torch.mean(y)) ** 2)
             if float(ss_tot.item()) <= 1e-18:
                 continue
-            sol = torch.linalg.lstsq(design, y.unsqueeze(-1)).solution
+            sol = torch.linalg.lstsq(design, y.unsqueeze(-1), driver="gelsd").solution
             y_hat = (design @ sol).squeeze(-1)
             ss_res = torch.sum((y - y_hat) ** 2)
             r2 = max(0.0, float((1.0 - ss_res / torch.clamp(ss_tot, min=1e-18)).item()))
