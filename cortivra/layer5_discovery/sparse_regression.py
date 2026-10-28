@@ -26,6 +26,12 @@ from cortivra.layer5_discovery.basis_library import (
     SymbolicBasisLibrary,
     estimate_characteristic_scales,
 )
+from cortivra.observability.flight_recorder import (
+    AlternativeBranchRecord,
+    OperatorSpectrumSummary,
+    emit_trace_node,
+    summarize_singular_spectrum,
+)
 
 
 @dataclass(frozen=True)
@@ -534,6 +540,38 @@ def discover_rational_pade_candidates(
                         )
                     )
 
+    if discovered:
+        discovered.sort(key=lambda c: c.bic_score)
+        best_pade = discovered[0]
+        pade_margin = (
+            float(discovered[1].bic_score - best_pade.bic_score)
+            if len(discovered) >= 2
+            else None
+        )
+        pade_expr = "; ".join(f"{k}: {v.to_infix()}" for k, v in best_pade.patch_expressions.items())
+        pade_alts = [
+            AlternativeBranchRecord(
+                branch_id=c.candidate_id,
+                expression_or_summary="; ".join(f"{k}: {v.to_infix()}" for k, v in c.patch_expressions.items()),
+                objective_score=round(float(c.bic_score), 4),
+                local_r2=round(float(c.vector_field_r2), 6),
+                complexity=c.total_complexity,
+            )
+            for c in discovered[1:4]
+        ]
+        emit_trace_node(
+            layer="layer5_discovery",
+            operation="discover_rational_pade_candidates",
+            target_name=brick.name,
+            local_error_metric=best_pade.vector_field_mse,
+            local_r2=best_pade.vector_field_r2,
+            decision_margin=pade_margin,
+            selected_branch_id=best_pade.candidate_id,
+            selected_expression=pade_expr,
+            alternatives=pade_alts,
+            metrics={"num_pade_candidates": len(discovered)},
+            skip_if_inner_loop=True,
+        )
     return discovered
 
 
@@ -568,6 +606,7 @@ def solve_sparse_pareto_front(
     for ext in extra_candidates:
         candidates_by_signature[ext.active_term_ids] = ext
 
+    design_spectrum: OperatorSpectrumSummary | None = None
     if num_terms > 0:
         flow_cols_pt = torch.stack([t.flow_column.to(torch.float64) for t in library.terms], dim=-1)
         a_mat, b_vec = build_weak_integral_system(
@@ -581,6 +620,10 @@ def solve_sparse_pareto_front(
         # Normalize columns to unit L2 norm for scale-invariant threshold & greedy selection
         col_norms = torch.clamp(torch.linalg.norm(a_mat, dim=0), min=1e-12)
         a_norm = a_mat / col_norms.unsqueeze(0)
+        design_spectrum = summarize_singular_spectrum(
+            a_norm,
+            operator_name=f"WeakIntegralDesign({library.thermodynamic_slot})",
+        )
         non_neg_all = torch.tensor(
             [t.require_non_negative_coeff for t in library.terms],
             dtype=torch.bool,
@@ -812,11 +855,49 @@ def solve_sparse_pareto_front(
 
     pareto_list.sort(key=lambda c: c.bic_score)
     final_all.sort(key=lambda c: c.bic_score)
+    best_cand = pareto_list[0] if pareto_list else (final_all[0] if final_all else None)
+
+    if best_cand is not None:
+        bic_margin = (
+            float(final_all[1].bic_score - best_cand.bic_score)
+            if len(final_all) >= 2
+            else None
+        )
+        best_expr_str = "; ".join(
+            f"{k}: {v.to_infix()}" for k, v in best_cand.patch_expressions.items()
+        )
+        alts = [
+            AlternativeBranchRecord(
+                branch_id=c.candidate_id,
+                expression_or_summary="; ".join(f"{k}: {v.to_infix()}" for k, v in c.patch_expressions.items()),
+                objective_score=round(float(c.bic_score), 4),
+                local_r2=round(float(c.vector_field_r2), 6),
+                complexity=c.total_complexity,
+            )
+            for c in final_all[1:5]
+        ]
+        emit_trace_node(
+            layer="layer5_discovery",
+            operation="solve_sparse_pareto_front",
+            target_name=library.thermodynamic_slot,
+            local_error_metric=best_cand.vector_field_mse,
+            local_r2=best_cand.vector_field_r2,
+            decision_margin=bic_margin,
+            selected_branch_id=best_cand.candidate_id,
+            selected_expression=best_expr_str,
+            operator_spectrum=design_spectrum,
+            alternatives=alts,
+            metrics={
+                "num_pareto_candidates": len(pareto_list),
+                "num_total_candidates": len(final_all),
+                "winning_bic": round(float(best_cand.bic_score), 4),
+            },
+        )
 
     return ParetoDiscoveryReport(
         pareto_front=tuple(pareto_list),
         all_candidates=tuple(final_all),
-        best_candidate=pareto_list[0] if pareto_list else (final_all[0] if final_all else None),
+        best_candidate=best_cand,
     )
 
 
@@ -1134,6 +1215,26 @@ def discover_conservation_invariants(
             )
 
     invariants.sort(key=lambda inv: (len(inv.term_weights), inv.relative_drift))
+    if last_s_norm:
+        lie_spec = summarize_singular_spectrum(
+            torch.tensor(last_s_norm, dtype=torch.float64),
+            operator_name=f"LieDerivative({brick.name})",
+            null_abs_tol=nullspace_tol,
+        )
+    else:
+        lie_spec = None
+
+    emit_trace_node(
+        layer="layer5_discovery",
+        operation="discover_conservation_invariants",
+        target_name=brick.name,
+        selected_expression=", ".join(inv.infix_expression for inv in invariants) or "none",
+        operator_spectrum=lie_spec,
+        metrics={
+            "num_invariants": len(invariants),
+            "invariants": [inv.infix_expression for inv in invariants],
+        },
+    )
     return InvariantDiscoveryReport(
         invariants=tuple(invariants),
         num_invariants=len(invariants),

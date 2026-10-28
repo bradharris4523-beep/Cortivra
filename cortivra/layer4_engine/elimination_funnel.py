@@ -18,6 +18,10 @@ from cortivra.layer4_engine.rollout_arena import (
     estimate_trajectory_derivatives,
     rollout_trajectories,
 )
+from cortivra.observability.flight_recorder import (
+    AlternativeBranchRecord,
+    emit_trace_node,
+)
 
 
 @dataclass(frozen=True)
@@ -610,6 +614,54 @@ def run_elimination_funnel(
 
     cert = audit_law_brick(brick, sample_state=audit_states, sample_params=audit_params)
 
+    sorted_s4 = torch.argsort(total_scores).tolist()
+    funnel_margin = (
+        float(total_scores[sorted_s4[1]].item() - total_scores[sorted_s4[0]].item())
+        if len(sorted_s4) >= 2 and math.isfinite(float(total_scores[sorted_s4[1]].item()))
+        else None
+    )
+    alt_branches: list[AlternativeBranchRecord] = []
+    for rank_i in sorted_s4[1:4]:
+        sc_val = float(total_scores[rank_i].item())
+        if not math.isfinite(sc_val) or sc_val >= 1e11:
+            continue
+        p_vec_i = {
+            pp.name: round(float(candidates_s3[rank_i, j_p].item()), 5)
+            for j_p, pp in enumerate(brick.param_specs)
+        }
+        alt_branches.append(
+            AlternativeBranchRecord(
+                branch_id=f"funnel_survivor_{rank_i}",
+                expression_or_summary=str(p_vec_i),
+                objective_score=round(sc_val, 6),
+                local_r2=round(float(v_r2), 5),
+                complexity=brick.param_dim,
+            )
+        )
+    best_p_dict = {
+        pp.name: round(float(best_params[0, j_p].item()), 6)
+        for j_p, pp in enumerate(brick.param_specs)
+    }
+    max_shield_v = max((r.max_violation for r in cert.results if not r.passed), default=0.0)
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="run_elimination_funnel",
+        target_name=brick.name,
+        local_error_metric=v_mse,
+        local_r2=v_r2,
+        global_error_metric=t_mse,
+        global_r2=t_r2,
+        physical_violation_metric=max_shield_v,
+        decision_margin=funnel_margin,
+        selected_branch_id=f"funnel_survivor_{best_idx}",
+        selected_expression=str(best_p_dict),
+        alternatives=alt_branches,
+        metrics={
+            "stage_candidate_counts": [n_stage1, n_stage2, n_stage3, 1],
+            "calibrated_params": best_p_dict,
+        },
+    )
+
     return EliminationFunnelReport(
         best_params=best_params,
         best_rollout=best_roll,
@@ -680,4 +732,39 @@ def rank_hypothesis_portfolio(
         )
 
     entries.sort(key=lambda e: (not e.passed_thermodynamic_audit, e.bic_score))
+    if entries:
+        winner = entries[0]
+        bic_marg = (
+            float(entries[1].bic_score - winner.bic_score)
+            if len(entries) >= 2
+            else None
+        )
+        alts = [
+            AlternativeBranchRecord(
+                branch_id=e.brick_name,
+                expression_or_summary=f"domain={e.domain}, passed_audit={e.passed_thermodynamic_audit}",
+                objective_score=round(float(e.bic_score), 4),
+                local_r2=round(float(e.funnel_report.vector_field_r2), 6),
+                complexity=e.symbolic_complexity,
+            )
+            for e in entries[1:5]
+        ]
+        emit_trace_node(
+            layer="layer4_engine",
+            operation="rank_hypothesis_portfolio",
+            target_name=winner.brick_name,
+            local_error_metric=winner.funnel_report.vector_field_mse,
+            local_r2=winner.funnel_report.vector_field_r2,
+            global_error_metric=winner.funnel_report.trajectory_mse,
+            global_r2=winner.funnel_report.trajectory_r2,
+            decision_margin=bic_marg,
+            selected_branch_id=winner.brick_name,
+            selected_expression=f"winner={winner.brick_name} (BIC={winner.bic_score:.4f})",
+            alternatives=alts,
+            metrics={
+                "num_hypotheses": len(entries),
+                "winning_bic": round(float(winner.bic_score), 4),
+            },
+            skip_if_inner_loop=True,
+        )
     return entries

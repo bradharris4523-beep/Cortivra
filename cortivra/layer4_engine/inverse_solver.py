@@ -28,6 +28,11 @@ from cortivra.layer4_engine.rollout_arena import (
     estimate_trajectory_derivatives,
     rollout_trajectories,
 )
+from cortivra.observability.flight_recorder import (
+    OperatorSpectrumSummary,
+    emit_trace_node,
+    summarize_singular_spectrum,
+)
 
 
 @dataclass(frozen=True)
@@ -272,6 +277,7 @@ def solve_boundary_value_shooting(
     n_targ = len(target_idx)
     eye_free = torch.eye(n_free, dtype=torch.float64, device=device)
     lm_lambda = 1e-4
+    shoot_spec: OperatorSpectrumSummary | None = None
 
     for _ in range(max(max_iters - warm_steps, 10)):
         f_req = free_curr.clone().requires_grad_(True)
@@ -295,6 +301,10 @@ def solve_boundary_value_shooting(
             )[0]
             jac_rows.append(g_k)
         j_shoot = torch.stack(jac_rows, dim=0)  # [n_targ, n_free]
+        shoot_spec = summarize_singular_spectrum(
+            j_shoot.detach(),
+            operator_name=f"BoundaryShootingJacobian({brick.name})",
+        )
 
         lhs = (j_shoot.T @ j_shoot) + lm_lambda * eye_free
         rhs = -(j_shoot.T @ res_vec.detach().unsqueeze(-1))
@@ -327,13 +337,32 @@ def solve_boundary_value_shooting(
         record_flows_and_energies=True,
     )
     term_err = float(torch.linalg.norm(final_roll.states[0, -1, target_idx] - target_vals).item())
+    conv_ok = bool(term_err <= max(tol * 5.0, 1e-2))
+    viable_ok = bool(final_roll.all_time_viable_mask[0].item())
+
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="solve_boundary_value_shooting",
+        target_name=brick.name,
+        status="completed" if conv_ok else "failed",
+        global_error_metric=term_err,
+        physical_violation_metric=0.0 if viable_ok else 1.0,
+        selected_expression=f"x(0)={[round(float(v), 5) for v in x0_solved[0].tolist()]}",
+        operator_spectrum=shoot_spec,
+        metrics={
+            "terminal_error_norm": round(term_err, 8),
+            "converged": conv_ok,
+            "all_time_viable": viable_ok,
+        },
+        skip_if_inner_loop=True,
+    )
 
     return BoundaryShootingResult(
         solved_initial_state=x0_solved,
         rollout=final_roll,
         terminal_error_norm=term_err,
-        converged=(term_err <= max(tol * 5.0, 1e-2)),
-        all_time_viable=bool(final_roll.all_time_viable_mask[0].item()),
+        converged=conv_ok,
+        all_time_viable=viable_ok,
     )
 
 
@@ -421,6 +450,26 @@ def compute_parameter_leverage_and_fisher(
     leverage = (log_sens * tunable_mask) / (1.0 + 10.0 * risk_scores.detach())
     rank_order = torch.argsort(leverage, descending=True).tolist()
     ranked_names = tuple(param_names[idx] for idx in rank_order)
+
+    f_spec = summarize_singular_spectrum(
+        eigvals_desc.detach(),
+        operator_name=f"FisherMatrix({brick.name})",
+        matrix_shape=(param_dim, param_dim),
+    )
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="compute_parameter_leverage_and_fisher",
+        target_name=brick.name,
+        selected_expression=", ".join(ranked_names),
+        operator_spectrum=f_spec,
+        metrics={
+            "ranked_param_names": list(ranked_names),
+            "fisher_eigenvalues": [round(float(v), 6) for v in eigvals_desc.tolist()],
+            "restorative_leverage_scores": {
+                param_names[i]: round(float(leverage[i].item()), 6) for i in range(param_dim)
+            },
+        },
+    )
 
     return SensitivityAndFisherReport(
         param_names=param_names,
@@ -520,6 +569,23 @@ def solve_target_intervention(
         diff = float((p_final[0, idx] - p_base[0, idx]).item())
         if abs(diff) > 1e-12:
             deltas[pp.name] = diff
+
+    max_v = max((r.max_violation for r in cert.results if not r.passed), default=0.0)
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="solve_target_intervention",
+        target_name=brick.name,
+        local_error_metric=base_loss,
+        global_error_metric=final_loss,
+        physical_violation_metric=max_v,
+        selected_expression=str({k: round(v, 6) for k, v in deltas.items()}),
+        metrics={
+            "baseline_loss": round(base_loss, 6),
+            "intervened_loss": round(final_loss, 6),
+            "param_deltas": {k: round(v, 6) for k, v in deltas.items()},
+            "allowed_parameters": sorted(allowed_set),
+        },
+    )
 
     return InterventionSolution(
         baseline_params=p_base,
@@ -628,6 +694,24 @@ def solve_optimal_control_waveform(
     )
     final_loss = float(target_loss_fn(controlled_roll).detach().item())
     ctrl_energy = float(torch.mean(u_final**2).item())
+    viable_ctrl = bool(controlled_roll.all_time_viable_mask[0].item())
+
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="solve_optimal_control_waveform",
+        target_name=brick.name,
+        local_error_metric=base_loss,
+        global_error_metric=final_loss,
+        physical_violation_metric=0.0 if viable_ctrl else 1.0,
+        selected_expression=f"loss={base_loss:.4f}->{final_loss:.4f}, energy={ctrl_energy:.4f}",
+        metrics={
+            "baseline_loss": round(base_loss, 6),
+            "controlled_loss": round(final_loss, 6),
+            "control_energy": round(ctrl_energy, 6),
+            "all_time_viable": viable_ctrl,
+        },
+        skip_if_inner_loop=True,
+    )
 
     return OptimalControlResult(
         control_waveform=u_final,
@@ -635,5 +719,5 @@ def solve_optimal_control_waveform(
         baseline_loss=base_loss,
         controlled_loss=final_loss,
         control_energy=ctrl_energy,
-        all_time_viable=bool(controlled_roll.all_time_viable_mask[0].item()),
+        all_time_viable=viable_ctrl,
     )

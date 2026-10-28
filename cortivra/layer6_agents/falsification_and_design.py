@@ -20,6 +20,10 @@ from cortivra.layer4_engine.rollout_arena import (
     rollout_trajectories,
 )
 from cortivra.layer5_discovery.sparse_regression import InvariantDiscoveryReport
+from cortivra.observability.flight_recorder import (
+    AlternativeBranchRecord,
+    emit_trace_node,
+)
 
 
 @dataclass(frozen=True)
@@ -286,6 +290,33 @@ def design_disambiguating_experiment(
                 winner = "candidate_a" if err_a <= err_b else "candidate_b"
 
     amp_ratio = best_div / max(init_div_mse, 1e-15)
+    selected_id = candidate_a.name if winner == "candidate_a" else (candidate_b.name if winner == "candidate_b" else "undecided")
+    runner_up_id = candidate_b.name if winner == "candidate_a" else candidate_a.name
+    runner_err = err_b if winner == "candidate_a" else err_a
+    emit_trace_node(
+        layer="layer6_agents",
+        operation="design_disambiguating_experiment",
+        target_name=f"{candidate_a.name}_vs_{candidate_b.name}",
+        local_error_metric=min(err_a, err_b),
+        decision_margin=abs(log_ratio),
+        selected_branch_id=selected_id,
+        selected_expression=f"winner={winner} ({selected_id}), amp_ratio={amp_ratio:.2f}x",
+        alternatives=(
+            AlternativeBranchRecord(
+                branch_id=runner_up_id,
+                expression_or_summary=f"impostor={runner_up_id}",
+                objective_score=round(float(runner_err), 6),
+                local_r2=0.0,
+            ),
+        ),
+        metrics={
+            "initial_divergence_mse": round(float(init_div_mse), 6),
+            "maximized_divergence_mse": round(float(best_div), 6),
+            "divergence_amplification_ratio": round(float(amp_ratio), 4),
+            "winning_hypothesis": winner,
+            "discrimination_log_ratio": round(float(log_ratio), 4),
+        },
+    )
     return DisambiguatingExperimentReport(
         optimal_initial_state=best_x0.unsqueeze(0),
         optimal_control_stimulus=best_u,
@@ -543,6 +574,29 @@ def run_falsification_stress_test(
     )
 
     passed_all = all(g.passed for g in gates)
+    failed_g = [g for g in gates if not g.passed]
+    viol_metric = max((g.metric_value for g in failed_g), default=0.0)
+    emit_trace_node(
+        layer="layer6_agents",
+        operation="run_falsification_stress_test",
+        target_name=brick.name,
+        status="completed" if passed_all else "failed",
+        local_r2=noisy_r2,
+        global_r2=mh_report.horizon_4x_viable_fraction,
+        physical_violation_metric=viol_metric if not passed_all else 0.0,
+        selected_expression=f"passed_all={passed_all}, 4x_viable={mh_report.horizon_4x_viable_fraction:.3f}",
+        metrics={
+            "passed_all_gates": passed_all,
+            "noisy_vector_field_r2": round(float(noisy_r2), 5),
+            "ood_viable_fraction": round(float(ood_viable), 4),
+            "horizon_1x_viable_fraction": mh_report.horizon_1x_viable_fraction,
+            "horizon_2x_viable_fraction": mh_report.horizon_2x_viable_fraction,
+            "horizon_4x_viable_fraction": mh_report.horizon_4x_viable_fraction,
+            "min_safety_margin_4x": mh_report.min_safety_margin_4x,
+            "max_invariant_drift": round(float(max_drift), 6),
+        },
+        diagnostics=tuple(g.details for g in failed_g),
+    )
     return FalsificationStressReport(
         target_brick_name=brick.name,
         passed_all_gates=passed_all,
@@ -624,7 +678,7 @@ def crystallize_verified_law(
         + 0.5 * max(stress_report.ood_viable_fraction, 0.0),
     )
 
-    return vault.crystallize_discovered_law(
+    rec = vault.crystallize_discovered_law(
         law_id=final_law_id,
         name=brick.name,
         domain=brick.domain,
@@ -636,3 +690,20 @@ def crystallize_verified_law(
         parent_law_ids=parent_law_ids,
         description=final_desc,
     )
+    emit_trace_node(
+        layer="layer6_agents",
+        operation="crystallize_verified_law",
+        target_name=rec.law_id,
+        local_r2=stress_report.noisy_vector_field_r2,
+        global_r2=stress_report.ood_viable_fraction,
+        selected_branch_id=rec.law_id,
+        selected_expression=sym_expr,
+        metrics={
+            "law_id": rec.law_id,
+            "sha256_fingerprint": rec.sha256_fingerprint,
+            "falsification_score": round(f_score, 4),
+            "parent_law_ids": list(parent_law_ids),
+        },
+        skip_if_inner_loop=True,
+    )
+    return rec

@@ -15,6 +15,11 @@ from typing import Sequence, Union
 import numpy as np
 import torch
 
+from cortivra.observability.flight_recorder import (
+    emit_trace_node,
+    summarize_singular_spectrum,
+)
+
 NumericValue = Union[int, float, np.ndarray, torch.Tensor]
 _EXP_TOL = 1e-7
 
@@ -573,6 +578,26 @@ def discover_dimensionless_groups(
         residual = np.max(np.abs(d_mat @ np.array(cleaned, dtype=np.float64)))
         if residual <= 1e-5 and any(abs(x) > 1e-6 for x in cleaned):
             groups.append(DimensionlessGroup(variable_names=names, exponents=cleaned))
+
+    d_spec = summarize_singular_spectrum(
+        torch.as_tensor(d_mat, dtype=torch.float64),
+        operator_name=f"SIDimensionalMatrix(7x{k})",
+        null_abs_tol=tol,
+    )
+    emit_trace_node(
+        layer="layer1_axioms",
+        operation="discover_dimensionless_groups",
+        target_name=",".join(names[:4]) + ("..." if len(names) > 4 else ""),
+        selected_expression="; ".join(g.format_expression() for g in groups) if groups else "none",
+        operator_spectrum=d_spec,
+        metrics={
+            "num_variables": k,
+            "dimensional_rank": rank,
+            "num_pi_groups": len(groups),
+            "pi_groups": [g.format_expression() for g in groups],
+        },
+        skip_if_inner_loop=True,
+    )
     return groups
 
 

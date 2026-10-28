@@ -63,6 +63,11 @@ from cortivra.layer5_discovery.sparse_regression import (
     discover_rational_pade_candidates,
     solve_sparse_pareto_front,
 )
+from cortivra.observability.flight_recorder import (
+    AlternativeBranchRecord,
+    emit_trace_node,
+    summarize_singular_spectrum,
+)
 
 
 class HamiltonianPatchedLawBrick(LawBrick):
@@ -577,6 +582,32 @@ def detect_non_markovian_memory(
         static_r2 < 0.78 and lag1_autocorr > 0.70 and hysteresis_ratio > 0.65
     )
 
+    static_spec = summarize_singular_spectrum(
+        design,
+        operator_name=f"MarkovianStaticCubicBasis(state={primary_idx})",
+    )
+    emit_trace_node(
+        layer="layer5_discovery",
+        operation="detect_non_markovian_memory",
+        target_name=f"state_{primary_idx}",
+        local_r2=static_r2,
+        decision_margin=abs(hysteresis_ratio - 0.65),
+        selected_branch_id="non_markovian_latent_state" if is_non_markov else "markovian_state_function",
+        selected_expression=(
+            f"is_non_markovian={is_non_markov}, hysteresis={hysteresis_ratio:.3f}, "
+            f"static_r2={static_r2:.4f}, lag1_autocorr={lag1_autocorr:.3f}"
+        ),
+        operator_spectrum=static_spec,
+        metrics={
+            "is_non_markovian": is_non_markov,
+            "hysteresis_ratio": round(hysteresis_ratio, 4),
+            "static_basis_r2": round(static_r2, 6),
+            "residual_lag1_autocorr": round(lag1_autocorr, 4),
+            "primary_affected_state": primary_idx,
+        },
+        skip_if_inner_loop=True,
+    )
+
     return NonMarkovianMemoryReport(
         is_non_markovian=is_non_markov,
         hysteresis_ratio=hysteresis_ratio,
@@ -712,6 +743,31 @@ def discover_latent_state_augmentation(
             gradient_steps=45,
             learning_rate=0.03,
         )
+        emit_trace_node(
+            layer="layer5_discovery",
+            operation="discover_latent_state_augmentation",
+            target_name=osc_brick.name,
+            local_r2=osc_r2,
+            global_r2=funnel_osc.trajectory_r2,
+            decision_margin=abs(osc_r2 - latent_ode_r2),
+            selected_branch_id="oscillatory_2d",
+            selected_expression=f"oscillatory_2d (omega={omega_est:.4f}, R^2={funnel_osc.trajectory_r2:.5f})",
+            alternatives=(
+                AlternativeBranchRecord(
+                    branch_id="relaxation_1d",
+                    expression_or_summary=f"1D relaxation (k_decay={k_decay_est:.4f})",
+                    objective_score=round(1.0 - latent_ode_r2, 6),
+                    local_r2=round(latent_ode_r2, 6),
+                    complexity=2,
+                ),
+            ),
+            metrics={
+                "latent_mode_type": "oscillatory_2d",
+                "latent_ode_r2": round(osc_r2, 6),
+                "trajectory_r2": round(funnel_osc.trajectory_r2, 6),
+            },
+            skip_if_inner_loop=True,
+        )
         return LatentAugmentationResult(
             augmented_brick=osc_brick,
             calibrated_params=funnel_osc.best_params,
@@ -823,6 +879,31 @@ def discover_latent_state_augmentation(
         num_gradient_starts=4,
         gradient_steps=45,
         learning_rate=0.03,
+    )
+    emit_trace_node(
+        layer="layer5_discovery",
+        operation="discover_latent_state_augmentation",
+        target_name=aug_brick.name,
+        local_r2=latent_ode_r2,
+        global_r2=funnel.trajectory_r2,
+        decision_margin=abs(latent_ode_r2 - osc_r2),
+        selected_branch_id="relaxation_1d",
+        selected_expression=f"relaxation_1d (dz/dt = -{k_decay_est:.3f}*{latent_name} + {drive_expr.to_infix()})",
+        alternatives=(
+            AlternativeBranchRecord(
+                branch_id="oscillatory_2d",
+                expression_or_summary=f"2D harmonic oscillator (omega_sq={omega_sq_est:.4f})",
+                objective_score=round(1.0 - osc_r2, 6),
+                local_r2=round(osc_r2, 6),
+                complexity=3,
+            ),
+        ),
+        metrics={
+            "latent_mode_type": "relaxation_1d",
+            "latent_ode_r2": round(latent_ode_r2, 6),
+            "trajectory_r2": round(funnel.trajectory_r2, 6),
+        },
+        skip_if_inner_loop=True,
     )
 
     return LatentAugmentationResult(
@@ -1400,6 +1481,43 @@ def discover_and_compile_law(
         if ss_tot > 1e-15:
             out_of_sample_r2 = 1.0 - ss_res / ss_tot
 
+    port_margin = (
+        float(rankings[1].bic_score - winner_entry.bic_score)
+        if len(rankings) >= 2
+        else None
+    )
+    win_expr = "; ".join(f"{k}: {v.to_infix()}" for k, v in winning_cand.patch_expressions.items())
+    port_alts = [
+        AlternativeBranchRecord(
+            branch_id=r_e.brick_name,
+            expression_or_summary=f"slot={cand_by_brick_name[r_e.brick_name].thermodynamic_slot}: "
+            + "; ".join(f"{k}: {v.to_infix()}" for k, v in cand_by_brick_name[r_e.brick_name].patch_expressions.items()),
+            objective_score=round(float(r_e.bic_score), 4),
+            local_r2=round(float(r_e.funnel_report.vector_field_r2), 6),
+            complexity=r_e.symbolic_complexity,
+        )
+        for r_e in rankings[1:4]
+        if r_e.brick_name in cand_by_brick_name
+    ]
+    emit_trace_node(
+        layer="layer5_discovery",
+        operation="discover_and_compile_law",
+        target_name=winning_brick.name,
+        local_error_metric=winner_entry.funnel_report.vector_field_mse,
+        local_r2=winner_entry.funnel_report.vector_field_r2,
+        global_error_metric=winner_entry.funnel_report.trajectory_mse,
+        global_r2=out_of_sample_r2,
+        decision_margin=port_margin,
+        selected_branch_id=winning_brick.name,
+        selected_expression=win_expr,
+        alternatives=port_alts,
+        metrics={
+            "thermodynamic_slot": winning_cand.thermodynamic_slot,
+            "archetype": arch.archetype_name,
+            "out_of_sample_r2": round(float(out_of_sample_r2), 6),
+        },
+    )
+
     return ClosedLoopDiscoveryReport(
         discovery_triggered=True,
         winning_brick=winning_brick,
@@ -1584,6 +1702,23 @@ def discover_autonomous_symbolic_system(
         gradient_steps=40,
     )
     arch = classify_mathematical_archetype(compiled_brick, candidate=last_cand, is_latent_augmented=False)
+    emit_trace_node(
+        layer="layer5_discovery",
+        operation="discover_autonomous_symbolic_system",
+        target_name=compiled_brick.name,
+        local_error_metric=funnel.vector_field_mse,
+        local_r2=funnel.vector_field_r2,
+        global_error_metric=funnel.trajectory_mse,
+        global_r2=funnel.trajectory_r2,
+        selected_branch_id=compiled_brick.name,
+        selected_expression="; ".join(f"d({k})/dt = {v}" for k, v in per_state_str.items()),
+        metrics={
+            "per_state_expressions": per_state_str,
+            "num_invariants": inv_report.num_invariants,
+            "archetype": arch.archetype_name,
+        },
+        skip_if_inner_loop=True,
+    )
 
     return AutonomousDiscoveryReport(
         compiled_brick=compiled_brick,

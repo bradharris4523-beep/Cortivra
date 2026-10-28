@@ -29,6 +29,11 @@ from cortivra.layer1_axioms.units import (
     Quantity,
     Unit,
 )
+from cortivra.observability.flight_recorder import (
+    OperatorSpectrumSummary,
+    emit_trace_node,
+    summarize_singular_spectrum,
+)
 
 
 class ConservationViolationError(RuntimeError):
@@ -543,6 +548,7 @@ def analyze_unexplained_residual(
     # Compute state-space coherence R^2 across affected state components using SVD-stabilized
     # polynomial basis [1, x, x^2, x_i * x_j] to distinguish deterministic laws from random noise
     coherence_r2 = 0.0
+    coherence_spec: OperatorSpectrumSummary | None = None
     batch_size, state_dim = state.shape[0], state.shape[1]
     target_indices = affected_indices if affected_indices else (
         (int(torch.argmax(snr_per_state).item()),) if snr_per_state.numel() > 0 else ()
@@ -559,6 +565,10 @@ def analyze_unexplained_residual(
             ]
             basis_cols.extend(cross_terms)
         design = torch.cat(basis_cols, dim=-1)
+        coherence_spec = summarize_singular_spectrum(
+            design,
+            operator_name=f"ResidualCoherenceBasis({brick.name})",
+        )
         r2_scores: list[float] = []
         for idx in target_indices:
             y = residual_flow[:, idx].to(torch.float64)
@@ -587,53 +597,47 @@ def analyze_unexplained_residual(
         thermo_class = "active_driven"
 
     # Evaluate the 3-Gate Safeguard
+    justified = False
+    rej_reason: str | None = None
+    final_thermo = "none"
     if not parameter_fit_exhausted:
-        return LatentResidualAnalysis(
-            latent_term_justified=False,
-            rejection_reason="known_parameters_not_yet_exhausted",
-            max_snr=max_snr,
-            state_coherence_r2=coherence_r2,
-            affected_state_indices=affected_indices,
-            required_derivative_units=req_units,
-            thermodynamic_class="none",
-            residual_flow=residual_flow,
-            missing_power=missing_power,
-        )
+        rej_reason = "known_parameters_not_yet_exhausted"
+    elif max_snr < min_snr_threshold:
+        rej_reason = "residual_within_noise_floor"
+    elif coherence_r2 < min_coherence_r2:
+        rej_reason = "residual_is_uncorrelated_noise"
+    else:
+        justified = True
+        final_thermo = thermo_class
 
-    if max_snr < min_snr_threshold:
-        return LatentResidualAnalysis(
-            latent_term_justified=False,
-            rejection_reason="residual_within_noise_floor",
-            max_snr=max_snr,
-            state_coherence_r2=coherence_r2,
-            affected_state_indices=affected_indices,
-            required_derivative_units=req_units,
-            thermodynamic_class="none",
-            residual_flow=residual_flow,
-            missing_power=missing_power,
-        )
-
-    if coherence_r2 < min_coherence_r2:
-        return LatentResidualAnalysis(
-            latent_term_justified=False,
-            rejection_reason="residual_is_uncorrelated_noise",
-            max_snr=max_snr,
-            state_coherence_r2=coherence_r2,
-            affected_state_indices=affected_indices,
-            required_derivative_units=req_units,
-            thermodynamic_class="none",
-            residual_flow=residual_flow,
-            missing_power=missing_power,
-        )
+    emit_trace_node(
+        layer="layer1_axioms",
+        operation="analyze_unexplained_residual",
+        target_name=brick.name,
+        local_r2=coherence_r2,
+        decision_margin=max_snr - min_snr_threshold,
+        selected_branch_id="trigger_latent_discovery" if justified else "reject_latent_discovery",
+        selected_expression=f"justified={justified}, class={final_thermo}, max_snr={max_snr:.2f}",
+        operator_spectrum=coherence_spec,
+        metrics={
+            "latent_term_justified": justified,
+            "rejection_reason": rej_reason,
+            "max_snr": round(max_snr, 4),
+            "state_coherence_r2": round(coherence_r2, 6),
+            "thermodynamic_class": final_thermo,
+            "affected_state_indices": list(affected_indices),
+        },
+        skip_if_inner_loop=True,
+    )
 
     return LatentResidualAnalysis(
-        latent_term_justified=True,
-        rejection_reason=None,
+        latent_term_justified=justified,
+        rejection_reason=rej_reason,
         max_snr=max_snr,
         state_coherence_r2=coherence_r2,
         affected_state_indices=affected_indices,
         required_derivative_units=req_units,
-        thermodynamic_class=thermo_class,
+        thermodynamic_class=final_thermo,
         residual_flow=residual_flow,
         missing_power=missing_power,
     )
@@ -657,6 +661,21 @@ def audit_law_brick(
 
     results = (dim_res, thermo_res, viability_res)
     passed_all = all(r.passed for r in results)
+    max_v = max((r.max_violation for r in results if not r.passed), default=0.0)
+
+    emit_trace_node(
+        layer="layer1_axioms",
+        operation="audit_law_brick",
+        target_name=brick.name,
+        status="completed" if passed_all else "failed",
+        physical_violation_metric=max_v,
+        metrics={
+            "passed_all": passed_all,
+            "viable_fraction": round(viable_frac, 4),
+            "shields": {r.shield_name: {"passed": r.passed, "max_violation": r.max_violation} for r in results},
+        },
+        diagnostics=tuple(r.message for r in results if not r.passed),
+    )
 
     return AuditCertificate(
         target_name=brick.name,

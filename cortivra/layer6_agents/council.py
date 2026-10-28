@@ -78,6 +78,20 @@ from cortivra.layer6_agents.meta_clients import (
     ROLE_SYSTEM_PROMPTS,
     TOOL_MATHEMATICAL_SCHEMAS,
 )
+from cortivra.observability.causal_backtracker import (
+    CausalContradictionReport,
+    analyze_trace_and_backtrack_contradictions,
+)
+from cortivra.observability.flight_recorder import (
+    CausalTraceDAG,
+    FlightRecorder,
+    active_recorder,
+    emit_trace_node,
+)
+from cortivra.observability.forensic_report import (
+    format_forensic_xray_report,
+    serialize_trace_to_dict,
+)
 
 InverseProblemMode = Literal[
     "counterfactual_intervention",
@@ -202,6 +216,8 @@ class ScientificDiscoveryDossier:
     executive_summary: str
     llm_telemetry: tuple[LLMInferenceResponse, ...] = field(default_factory=tuple)
     primary_finding: PrimaryScientificFinding | None = None
+    causal_trace_dag: CausalTraceDAG | None = None
+    contradiction_report: CausalContradictionReport | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -225,7 +241,20 @@ class ScientificDiscoveryDossier:
                 else None
             ),
             "llm_telemetry": [asdict(t) for t in self.llm_telemetry],
+            "causal_trace": (
+                serialize_trace_to_dict(self.causal_trace_dag, self.contradiction_report)
+                if self.causal_trace_dag is not None
+                else None
+            ),
         }
+
+    def to_forensic_xray_report(self) -> str:
+        """
+        Format the CausalTraceDAG and root-cause contradiction backtracker report as Markdown.
+        """
+        if self.causal_trace_dag is None:
+            return "No causal trace recorded."
+        return format_forensic_xray_report(self.causal_trace_dag, self.contradiction_report)
 
     def to_markdown_report(self) -> str:
         """
@@ -423,6 +452,16 @@ def compile_with_self_repair(
             compiled = compile_symbolic_system(spec_obj)
             cert = audit_law_brick(compiled)
             if cert.passed_all:
+                emit_trace_node(
+                    layer="layer6_agents",
+                    operation="compile_with_self_repair",
+                    target_name=compiled.name,
+                    selected_expression=str(spec_obj.hamiltonian_expr),
+                    metrics={
+                        "attempts_used": attempt,
+                        "repair_diagnostics": list(diagnostics),
+                    },
+                )
                 return SelfRepairCompilationReport(
                     compiled_brick=compiled,
                     audit_certificate=cert,
@@ -485,6 +524,17 @@ class AutonomousScientificCouncil:
         """
         Execute an autonomous closed-loop investigation for `goal`.
         """
+        existing_rec = active_recorder()
+        if existing_rec is not None:
+            return self._execute_investigation(goal, existing_rec)
+        with FlightRecorder.session(session_id=f"investigation_{goal.domain}", question=goal.question) as rec:
+            return self._execute_investigation(goal, rec)
+
+    def _execute_investigation(
+        self,
+        goal: ScientificInvestigationGoal,
+        recorder: FlightRecorder,
+    ) -> ScientificDiscoveryDossier:
         self_repair_report: SelfRepairCompilationReport | None = None
         compiler_diags: list[str] = []
 
@@ -1187,6 +1237,19 @@ class AutonomousScientificCouncil:
                     key_metrics=metrics,
                 )
             )
+            emit_trace_node(
+                layer="layer6_agents",
+                operation=f"council_step_{tool_name}",
+                target_name=active_brick.name,
+                selected_branch_id=tool_name,
+                selected_expression=summary_str,
+                metrics={
+                    "step_index": step_idx,
+                    "agent_role": llm_resp.role,
+                    "provider_used": llm_resp.provider_used,
+                    **metrics,
+                },
+            )
 
         final_briefing = build_differential_epistemic_briefing(
             brick=active_brick,
@@ -1243,6 +1306,14 @@ class AutonomousScientificCouncil:
             else glimmer_resp.raw_content
         )
 
+        contradiction_rep = analyze_trace_and_backtrack_contradictions(
+            dag=recorder.dag,
+            brick=active_brick,
+            states=active_states,
+            params=active_params,
+            reference_states=goal.observed_states,
+        )
+
         return ScientificDiscoveryDossier(
             question=goal.question,
             final_brick=active_brick,
@@ -1269,6 +1340,8 @@ class AutonomousScientificCouncil:
             executive_summary=exec_summary,
             llm_telemetry=tuple(self.client.telemetry_log),
             primary_finding=primary_finding,
+            causal_trace_dag=recorder.dag,
+            contradiction_report=contradiction_rep,
         )
 
 

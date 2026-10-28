@@ -33,6 +33,7 @@ from cortivra.layer3_compiler.ast_nodes import (
     SymbolNode,
     parse_symbolic_expr,
 )
+from cortivra.observability.flight_recorder import emit_trace_node
 
 
 @dataclass(frozen=True)
@@ -500,7 +501,20 @@ class ResidualPatchedLawBrick(LawBrick):
 
 def compile_symbolic_system(spec: SymbolicSystemSpec) -> CompiledLawBrick:
     """Compile a declarative `SymbolicSystemSpec` into a verified GPU `CompiledLawBrick`."""
-    return CompiledLawBrick(spec)
+    brick = CompiledLawBrick(spec)
+    emit_trace_node(
+        layer="layer3_compiler",
+        operation="compile_symbolic_system",
+        target_name=brick.name,
+        selected_expression=str(spec.hamiltonian_expr),
+        metrics={
+            "domain": brick.domain,
+            "state_dim": brick.state_dim,
+            "param_dim": brick.param_dim,
+            "total_symbolic_complexity": brick.total_symbolic_complexity(),
+        },
+    )
+    return brick
 
 
 def compile_residual_patch_brick(
@@ -512,7 +526,7 @@ def compile_residual_patch_brick(
     constants: Mapping[str, Quantity | ConstNode] | None = None,
 ) -> ResidualPatchedLawBrick:
     """Compile a symbolic residual patch onto `base_brick` and return a `ResidualPatchedLawBrick`."""
-    return ResidualPatchedLawBrick(
+    brick = ResidualPatchedLawBrick(
         name=name,
         base_brick=base_brick,
         patch_param_specs=patch_param_specs,
@@ -520,3 +534,21 @@ def compile_residual_patch_brick(
         patch_expressions=patch_expressions,
         constants=constants,
     )
+    expr_summary = "; ".join(
+        f"{k}: {node.to_infix()}" for k, (node, _) in brick._compiled_patches.items()
+    )
+    emit_trace_node(
+        layer="layer3_compiler",
+        operation="compile_residual_patch_brick",
+        target_name=brick.name,
+        selected_branch_id=thermodynamic_mode,
+        selected_expression=expr_summary,
+        metrics={
+            "base_brick": base_brick.name,
+            "thermodynamic_mode": thermodynamic_mode,
+            "patch_complexity": brick.total_patch_complexity(),
+            "num_patch_params": len(patch_param_specs),
+        },
+        skip_if_inner_loop=True,
+    )
+    return brick

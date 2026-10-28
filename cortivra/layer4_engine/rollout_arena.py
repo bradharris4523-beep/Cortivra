@@ -11,6 +11,12 @@ import torch
 
 from cortivra.layer1_axioms.hamiltonian import LawBrick
 from cortivra.layer1_axioms.shields import compute_viable_universe_mask
+from cortivra.observability.flight_recorder import (
+    OperatorSpectrumSummary,
+    emit_trace_node,
+    summarize_singular_spectrum,
+    suppress_inner_trace,
+)
 
 
 @dataclass(frozen=True)
@@ -310,16 +316,33 @@ def retrodict_trajectory(
     flows_t = torch.stack([brick.flow(s, params) for s in chron_states], dim=1)
     energies_t = torch.stack([brick.hamiltonian_energy(s, params) for s in chron_states], dim=1)
     step_viable_t = torch.stack([compute_viable_universe_mask(brick, s) for s in chron_states], dim=1)
+    all_viable_t = step_viable_t.all(dim=1)
 
-    return RolloutResult(
+    res_obj = RolloutResult(
         states=states_t,
         flows=flows_t,
         energies=energies_t,
         step_viable_mask=step_viable_t,
-        all_time_viable_mask=step_viable_t.all(dim=1),
+        all_time_viable_mask=all_viable_t,
         dt=dt,
         integrator=f"retrodict_{mode}",
     )
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="retrodict_trajectory",
+        target_name=brick.name,
+        global_r2=res_obj.viable_fraction,
+        selected_branch_id=f"retrodict_{mode}",
+        selected_expression=f"x(0)={[round(float(v), 5) for v in states_t[0, 0].tolist()]}",
+        metrics={
+            "mode": mode,
+            "num_steps": num_steps,
+            "viable_fraction": round(res_obj.viable_fraction, 4),
+            "max_energy_drift": round(res_obj.max_energy_drift, 6),
+        },
+        skip_if_inner_loop=True,
+    )
+    return res_obj
 
 
 def _compute_batch_state_jacobian(
@@ -451,6 +474,30 @@ def find_steady_state_and_stability(
 
     max_real_t = torch.tensor(max_real_list, dtype=torch.float64, device=x.device)
 
+    jac_spec = (
+        summarize_singular_spectrum(
+            jac_final[0],
+            operator_name=f"StateJacobian({brick.name})",
+        )
+        if batch_size >= 1
+        else None
+    )
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="find_steady_state_and_stability",
+        target_name=brick.name,
+        local_error_metric=float(res_norms[0].item()) if batch_size >= 1 else 0.0,
+        selected_branch_id=classes[0] if classes else "none",
+        selected_expression=f"stability={classes[0] if classes else 'none'}, max_real_eig={max_real_list[0]:.5f}",
+        operator_spectrum=jac_spec,
+        metrics={
+            "converged_fraction": round(float(converged.to(torch.float64).mean().item()), 4),
+            "max_real_eigenvalue": round(max_real_list[0], 6) if max_real_list else 0.0,
+            "stability_classes": classes[:4],
+        },
+        skip_if_inner_loop=True,
+    )
+
     return EquilibriumAnalysis(
         equilibrium_state=x,
         residual_norm=res_norms,
@@ -528,13 +575,14 @@ def discover_equilibrium_landscape(
             probes[1] = brick.clamp_to_hard_bounds(torch.zeros_like(default_x))[0]
 
     p_batch = p_single.expand(n_probes, -1)
-    eq_batch = find_steady_state_and_stability(
-        brick=brick,
-        initial_guess=probes,
-        params=p_batch,
-        max_newton_iters=max_newton_iters,
-        tol=tol,
-    )
+    with suppress_inner_trace():
+        eq_batch = find_steady_state_and_stability(
+            brick=brick,
+            initial_guess=probes,
+            params=p_batch,
+            max_newton_iters=max_newton_iters,
+            tol=tol,
+        )
 
     distinct_roots: list[torch.Tensor] = []
     distinct_classes: list[str] = []
@@ -580,6 +628,29 @@ def discover_equilibrium_landscape(
     )
     unstable_idx = tuple(
         i for i, c in enumerate(classes_t) if c in ("unstable_saddle_or_node", "unstable_spiral_or_hopf")
+    )
+
+    jac_spec_land: OperatorSpectrumSummary | None = None
+    if distinct_t.shape[0] >= 1:
+        _, j_root0 = _compute_batch_state_jacobian(brick, distinct_t[:1], p_single)
+        jac_spec_land = summarize_singular_spectrum(
+            j_root0[0],
+            operator_name=f"EquilibriumJacobian({brick.name})",
+        )
+
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="discover_equilibrium_landscape",
+        target_name=brick.name,
+        selected_expression=f"{len(classes_t)} equilibria: {list(classes_t)}",
+        operator_spectrum=jac_spec_land,
+        metrics={
+            "num_distinct_equilibria": len(classes_t),
+            "stability_classes": list(classes_t),
+            "num_stable_attractors": len(stable_idx),
+            "num_unstable_fixed_points": len(unstable_idx),
+        },
+        skip_if_inner_loop=True,
     )
 
     return EquilibriumLandscapeReport(
@@ -631,14 +702,15 @@ def scan_parameter_bifurcation(
     p_sweep[:, p_idx] = grid
 
     x_guesses = initial_guess[:1].detach().to(dtype=torch.float64, device=device).expand(n_grid, -1).clone()
-    eq_res = find_steady_state_and_stability(
-        brick=brick,
-        initial_guess=x_guesses,
-        params=p_sweep,
-        max_newton_iters=max_newton_iters,
-        tol=tol,
-        eigen_zero_tol=eigen_zero_tol,
-    )
+    with suppress_inner_trace():
+        eq_res = find_steady_state_and_stability(
+            brick=brick,
+            initial_guess=x_guesses,
+            params=p_sweep,
+            max_newton_iters=max_newton_iters,
+            tol=tol,
+            eigen_zero_tol=eigen_zero_tol,
+        )
 
     bif_indices: list[int] = []
     crit_params: list[float] = []
@@ -662,6 +734,20 @@ def scan_parameter_bifurcation(
             else:
                 theta_c = 0.5 * (p0 + p1)
             crit_params.append(theta_c)
+
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="scan_parameter_bifurcation",
+        target_name=f"{brick.name}.{param_name}",
+        selected_expression=f"bifurcations={len(crit_params)}, crit_params={[round(c, 5) for c in crit_params]}",
+        metrics={
+            "param_name": param_name,
+            "num_grid_points": n_grid,
+            "bifurcation_indices": list(bif_indices),
+            "critical_param_estimates": [round(c, 6) for c in crit_params],
+        },
+        skip_if_inner_loop=True,
+    )
 
     return BifurcationScanReport(
         param_name=param_name,

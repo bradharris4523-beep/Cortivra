@@ -17,6 +17,7 @@ Provides:
 from __future__ import annotations
 
 from cortivra.layer1_axioms.vault import CrystallizedLawRecord, LawVault
+from cortivra.observability.flight_recorder import emit_trace_node
 from cortivra.layer2_fabric.electrodynamics_and_circuits import NonlinearConductanceCircuitBrick
 from cortivra.layer2_fabric.kinetics_and_thermodynamics import (
     CooperativeBindingBrick,
@@ -134,6 +135,14 @@ def register_foundational_laws(vault: LawVault) -> list[CrystallizedLawRecord]:
                 description=desc,
             )
             registered.append(rec)
+    emit_trace_node(
+        layer="layer2_fabric",
+        operation="register_foundational_laws",
+        target_name="LawVault",
+        selected_expression=f"{len(registered)} core laws registered",
+        metrics={"num_laws": len(registered), "law_ids": [r.law_id for r in registered]},
+        skip_if_inner_loop=True,
+    )
     return registered
 
 
