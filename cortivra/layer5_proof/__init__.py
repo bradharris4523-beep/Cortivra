@@ -1,13 +1,61 @@
 """
-Layer 5 (`layer5_proof`) — Proof & Stress Testing.
-
-Goal:
-    Make sure a winning result isn't a fluke by shaking it with noise and jitter,
-    keeping the simplest equation, and testing if the engine can rediscover
-    known science from scratch.
-
-Modules (Planned):
-    - `falsification.py`:   Tests solutions against thermal noise and parameter changes.
-    - `identifiability.py`: Picks the simplest equation that explains the data.
-    - `rediscovery.py`:     Blind tests to see if Cortivra can figure out known laws from scratch.
+Layer 5 (`cortivra.layer5_proof`) — Alias and unified export of `cortivra.layer5_discovery`.
 """
+
+from cortivra.layer5_discovery import (
+    ArchetypeFingerprint,
+    AutonomousDiscoveryReport,
+    CandidateBasisTerm,
+    ClosedLoopDiscoveryReport,
+    ConservationInvariant,
+    HamiltonianPatchedLawBrick,
+    InvariantDiscoveryReport,
+    LatentAugmentationResult,
+    LatentAugmentedLawBrick,
+    LatentOscillatorAugmentedLawBrick,
+    NonMarkovianMemoryReport,
+    ParetoDiscoveryReport,
+    SymbolicBasisLibrary,
+    SymbolicCandidate,
+    build_weak_integral_system,
+    classify_mathematical_archetype,
+    compile_symbolic_candidate,
+    detect_non_markovian_memory,
+    discover_and_compile_law,
+    discover_autonomous_symbolic_system,
+    discover_conservation_invariants,
+    discover_latent_state_augmentation,
+    discover_rational_pade_candidates,
+    estimate_characteristic_scales,
+    generate_symbolic_basis_library,
+    solve_sparse_pareto_front,
+)
+
+__all__ = [
+    "CandidateBasisTerm",
+    "SymbolicBasisLibrary",
+    "estimate_characteristic_scales",
+    "generate_symbolic_basis_library",
+    "SymbolicCandidate",
+    "ParetoDiscoveryReport",
+    "ConservationInvariant",
+    "InvariantDiscoveryReport",
+    "build_weak_integral_system",
+    "discover_rational_pade_candidates",
+    "solve_sparse_pareto_front",
+    "discover_conservation_invariants",
+    "HamiltonianPatchedLawBrick",
+    "LatentAugmentedLawBrick",
+    "LatentOscillatorAugmentedLawBrick",
+    "NonMarkovianMemoryReport",
+    "LatentAugmentationResult",
+    "ArchetypeFingerprint",
+    "ClosedLoopDiscoveryReport",
+    "AutonomousDiscoveryReport",
+    "detect_non_markovian_memory",
+    "discover_latent_state_augmentation",
+    "compile_symbolic_candidate",
+    "classify_mathematical_archetype",
+    "discover_and_compile_law",
+    "discover_autonomous_symbolic_system",
+]

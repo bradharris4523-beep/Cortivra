@@ -1,12 +1,89 @@
 """
-Layer 6 (`layer6_agents`) — Meta AI Agents.
-
-Goal:
-    Use Meta's AI models (`Muse Wonder`, `Muse Spark`, `Muse Spark Open`,
-    `Muse Glimmer`, and `SAM 3.1`) to turn questions into hypotheses, run the
-    simulator, and learn from what fails.
-
-Modules (Planned):
-    - `council.py`:      Coordinates the AI models to propose, test, and refine ideas.
-    - `meta_clients.py`: Connects to the Meta Model API and partner GPU endpoints.
+Layer 6 (`cortivra.layer6_agents`) — Autonomous multi-agent scientific council,
+differential epistemic telemetry, active adversarial experimental design, and
+multi-provider AI inference (`Fireworks AI`, `Baseten`, `Meta Model API`).
 """
+
+from cortivra.layer6_agents.council import (
+    AutonomousScientificCouncil,
+    EpistemicStepRecord,
+    InverseProblemMode,
+    PrimaryScientificFinding,
+    ScientificDiscoveryDossier,
+    ScientificInvestigationGoal,
+    SelfRepairCompilationReport,
+    compile_with_self_repair,
+)
+from cortivra.layer6_agents.epistemic_telemetry import (
+    DifferentialEpistemicBriefing,
+    EquilibriumTelemetrySummary,
+    MultiHorizonTelemetrySummary,
+    ParamTelemetrySummary,
+    ResidualTelemetrySummary,
+    SensitivityTelemetrySummary,
+    StateTelemetrySummary,
+    VaultAnalogueMatch,
+    build_differential_epistemic_briefing,
+    format_compiler_or_shield_diagnostic,
+    search_vault_isomorphisms,
+)
+from cortivra.layer6_agents.falsification_and_design import (
+    DisambiguatingExperimentReport,
+    FalsificationGateResult,
+    FalsificationStressReport,
+    MultiHorizonStabilityReport,
+    crystallize_verified_law,
+    design_disambiguating_experiment,
+    run_falsification_stress_test,
+    verify_multi_horizon_stability,
+)
+from cortivra.layer6_agents.meta_clients import (
+    AgentRole,
+    LLMInferenceRequest,
+    LLMInferenceResponse,
+    MathematicalEpistemicPolicy,
+    MultiProviderMetaClient,
+    ProviderEndpointConfig,
+    ProviderName,
+    ROLE_SYSTEM_PROMPTS,
+    TOOL_MATHEMATICAL_SCHEMAS,
+)
+
+__all__ = [
+    "ProviderName",
+    "AgentRole",
+    "ProviderEndpointConfig",
+    "LLMInferenceRequest",
+    "LLMInferenceResponse",
+    "MathematicalEpistemicPolicy",
+    "MultiProviderMetaClient",
+    "ROLE_SYSTEM_PROMPTS",
+    "TOOL_MATHEMATICAL_SCHEMAS",
+    "StateTelemetrySummary",
+    "ParamTelemetrySummary",
+    "EquilibriumTelemetrySummary",
+    "SensitivityTelemetrySummary",
+    "ResidualTelemetrySummary",
+    "MultiHorizonTelemetrySummary",
+    "VaultAnalogueMatch",
+    "DifferentialEpistemicBriefing",
+    "build_differential_epistemic_briefing",
+    "search_vault_isomorphisms",
+    "format_compiler_or_shield_diagnostic",
+    "MultiHorizonStabilityReport",
+    "DisambiguatingExperimentReport",
+    "FalsificationGateResult",
+    "FalsificationStressReport",
+    "verify_multi_horizon_stability",
+    "design_disambiguating_experiment",
+    "run_falsification_stress_test",
+    "crystallize_verified_law",
+    "InverseProblemMode",
+    "PrimaryScientificFinding",
+    "SelfRepairCompilationReport",
+    "EpistemicStepRecord",
+    "ScientificInvestigationGoal",
+    "ScientificDiscoveryDossier",
+    "compile_with_self_repair",
+    "AutonomousScientificCouncil",
+]
