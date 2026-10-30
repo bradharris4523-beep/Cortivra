@@ -21,6 +21,7 @@ from cortivra.layer4_engine.rollout_arena import (
 from cortivra.observability.flight_recorder import (
     AlternativeBranchRecord,
     emit_trace_node,
+    record_simulation_activity,
 )
 
 
@@ -112,6 +113,7 @@ def sample_parameter_universes(
     if not tunable_indices:
         return default_p.expand(num_samples, -1).clone()
 
+    record_simulation_activity(sobol_qmc_universes_sampled=num_samples)
     sobol = torch.quasirandom.SobolEngine(dimension=len(tunable_indices), scramble=True, seed=seed)
     u = sobol.draw(num_samples).to(dtype=dtype, device=device)  # [num_samples, len(tunable)]
 
@@ -162,6 +164,91 @@ def _compute_r2(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
     if ss_tot <= 1e-18:
         return 1.0 if ss_res <= 1e-15 else 0.0
     return max(0.0, 1.0 - (ss_res / ss_tot))
+
+
+def _build_adaptive_surrogate_zoom_candidates(
+    brick: LawBrick,
+    candidates_s1: torch.Tensor,
+    losses_s1: torch.Tensor,
+    default_p: torch.Tensor,
+    custom_bounds: Mapping[str, tuple[float, float]] | None = None,
+    seed: int = 42,
+) -> torch.Tensor | None:
+    """
+    Wave-2 Adaptive Surrogate Trust-Region Zoom:
+    Fits a local ridge-regularized quadratic response surface over the top elite Sobol
+    universes from Wave 1, computes the analytical surrogate minimizer `theta_surr*`, and
+    draws a focused quasi-random Sobol batch inside the narrowed high-probability trust region.
+    """
+    n_stage1 = int(candidates_s1.shape[0])
+    tunable_indices = [idx for idx, pp in enumerate(brick.param_specs) if pp.tunable]
+    if n_stage1 < 16 or not tunable_indices:
+        return None
+
+    finite_mask = torch.isfinite(losses_s1) & (losses_s1 < 1e15)
+    if int(torch.sum(finite_mask).item()) < 4:
+        return None
+
+    order = torch.argsort(losses_s1)
+    k_elite = min(max(8, n_stage1 // 6), int(torch.sum(finite_mask).item()))
+    elite_idx = order[:k_elite]
+    elite_full = candidates_s1[elite_idx]
+    elite_p = elite_full[:, tunable_indices]  # [K, D_tun]
+    elite_y = losses_s1[elite_idx]  # [K]
+
+    device = candidates_s1.device
+    dtype = candidates_s1.dtype
+    d_tun = len(tunable_indices)
+
+    best_tun = elite_p[0]
+    std_tun = torch.clamp(torch.std(elite_p, dim=0, unbiased=False), min=1e-6)
+    delta_norm = (elite_p - best_tun.unsqueeze(0)) / std_tun.unsqueeze(0)  # [K, D_tun]
+
+    # Fit ridge-regularized separable quadratic surrogate: y ~ c + g^T z + 0.5 * sum_j h_j z_j^2
+    ones = torch.ones((k_elite, 1), dtype=dtype, device=device)
+    design = torch.cat([ones, delta_norm, 0.5 * (delta_norm ** 2)], dim=-1)  # [K, 1 + 2*D_tun]
+    reg_eye = 1e-3 * torch.eye(design.shape[1], dtype=dtype, device=device)
+    lhs = (design.T @ design) + reg_eye
+    rhs = design.T @ elite_y.unsqueeze(-1)
+    w_surr = torch.linalg.lstsq(lhs, rhs, driver="gelsd").solution.squeeze(-1)
+    g_vec = w_surr[1 : 1 + d_tun]
+    h_vec = torch.clamp(torch.abs(w_surr[1 + d_tun :]), min=0.5)
+    step_norm = torch.clamp(-g_vec / h_vec, min=-1.5, max=1.5)
+    surr_vertex_tun = best_tun + step_norm * std_tun
+
+    # Construct narrowed Wave-2 trust-region bounds around top-4 centroid
+    top4_tun = elite_p[: min(4, k_elite)]
+    weights = torch.softmax(-elite_y[: min(4, k_elite)] / max(float(torch.std(elite_y).item()), 1e-6), dim=0)
+    center_tun = torch.sum(top4_tun * weights.unsqueeze(-1), dim=0)
+
+    global_bounds = _infer_param_sampling_bounds(brick, custom_bounds=custom_bounds)
+    zoom_bounds: dict[str, tuple[float, float]] = dict(custom_bounds) if custom_bounds else {}
+    for col_i, param_idx in enumerate(tunable_indices):
+        pp = brick.param_specs[param_idx]
+        g_lo, g_hi, _ = global_bounds[param_idx]
+        c_val = float(center_tun[col_i].item())
+        s_val = float(std_tun[col_i].item())
+        half_span = max(1.35 * s_val, 0.04 * abs(c_val) + 1e-5)
+        z_lo = max(g_lo, c_val - half_span)
+        z_hi = min(g_hi, c_val + half_span)
+        if z_hi > z_lo + 1e-9:
+            zoom_bounds[pp.name] = (z_lo, z_hi)
+
+    n_zoom = max(16, min(64, n_stage1 // 4))
+    zoom_cands = sample_parameter_universes(
+        brick,
+        num_samples=n_zoom,
+        seed=seed + 777,
+        custom_bounds=zoom_bounds,
+        dtype=dtype,
+        device=device,
+    )
+    # Inject analytical surrogate vertex at index 0 and best Wave-1 neighbor perturbation at index 1
+    surr_full = elite_full[0:1].clone()
+    for col_i, param_idx in enumerate(tunable_indices):
+        surr_full[0, param_idx] = surr_vertex_tun[col_i]
+    zoom_cands[0] = _project_tunable_params(brick, surr_full, default_p, custom_bounds=custom_bounds)[0]
+    return zoom_cands
 
 
 def _levenberg_marquardt_vector_field_polish(
@@ -362,9 +449,35 @@ def run_elimination_funnel(
             err = torch.where(torch.isfinite(err), err, torch.full_like(err, 1e18))
             vf_losses = vf_losses + err / float(m_pts)
 
-        top_s2_idx = torch.argsort(vf_losses)[:n_stage2]
-        candidates_s2 = candidates_s1[top_s2_idx]
-        x0_s2 = x0_s1[top_s2_idx]
+        zoom_cands = _build_adaptive_surrogate_zoom_candidates(
+            brick=brick,
+            candidates_s1=candidates_s1,
+            losses_s1=vf_losses,
+            default_p=default_p,
+            custom_bounds=custom_bounds,
+            seed=seed,
+        )
+        if zoom_cands is not None:
+            n_zoom = int(zoom_cands.shape[0])
+            zoom_losses = torch.zeros((n_zoom,), dtype=torch.float64, device=device)
+            for m_i in range(m_pts):
+                x_rep_z = pts_x[m_i : m_i + 1].expand(n_zoom, -1)
+                dx_rep_z = pts_dx[m_i : m_i + 1].expand(n_zoom, -1)
+                pred_f_z = brick.flow(x_rep_z, zoom_cands)
+                err_z = torch.mean((pred_f_z - dx_rep_z) ** 2, dim=-1)
+                err_z = torch.where(torch.isfinite(err_z), err_z, torch.full_like(err_z, 1e18))
+                zoom_losses = zoom_losses + err_z / float(m_pts)
+            all_cands_s1 = torch.cat([candidates_s1, zoom_cands], dim=0)
+            all_x0_s1 = torch.cat([x0_s1, x0_single.expand(n_zoom, -1).clone()], dim=0)
+            all_vf_losses = torch.cat([vf_losses, zoom_losses], dim=0)
+        else:
+            all_cands_s1 = candidates_s1
+            all_x0_s1 = x0_s1
+            all_vf_losses = vf_losses
+
+        top_s2_idx = torch.argsort(all_vf_losses)[:n_stage2]
+        candidates_s2 = all_cands_s1[top_s2_idx]
+        x0_s2 = all_x0_s1[top_s2_idx]
     else:
         short_steps = min(t_steps - 1, 8)
         short_roll = rollout_trajectories(
@@ -376,9 +489,42 @@ def run_elimination_funnel(
         short_mse = torch.mean((pred_sub - target_sub) ** 2, dim=(1, 2))
         viable_pen = torch.where(short_roll.all_time_viable_mask, 0.0, 1e12)
         scores = torch.where(torch.isfinite(short_mse), short_mse + viable_pen, torch.full_like(short_mse, 1e18))
-        top_s2_idx = torch.argsort(scores)[:n_stage2]
-        candidates_s2 = candidates_s1[top_s2_idx]
-        x0_s2 = x0_s1[top_s2_idx]
+
+        zoom_cands = (
+            _build_adaptive_surrogate_zoom_candidates(
+                brick=brick,
+                candidates_s1=candidates_s1,
+                losses_s1=scores,
+                default_p=default_p,
+                custom_bounds=custom_bounds,
+                seed=seed,
+            )
+            if not optimize_hidden_x0
+            else None
+        )
+        if zoom_cands is not None:
+            n_zoom = int(zoom_cands.shape[0])
+            x0_zoom = x0_single.expand(n_zoom, -1).clone()
+            zoom_roll = rollout_trajectories(
+                brick, x0_zoom, zoom_cands, dt=dt, num_steps=short_steps, integrator=integrator,
+                record_flows_and_energies=False,
+            )
+            pred_sub_z = zoom_roll.states[:, :, obs_idx]
+            target_sub_z = obs_traj[:1, : short_steps + 1, :].expand(n_zoom, -1, -1)
+            short_mse_z = torch.mean((pred_sub_z - target_sub_z) ** 2, dim=(1, 2))
+            viable_pen_z = torch.where(zoom_roll.all_time_viable_mask, 0.0, 1e12)
+            scores_z = torch.where(torch.isfinite(short_mse_z), short_mse_z + viable_pen_z, torch.full_like(short_mse_z, 1e18))
+            all_cands_s1 = torch.cat([candidates_s1, zoom_cands], dim=0)
+            all_x0_s1 = torch.cat([x0_s1, x0_zoom], dim=0)
+            all_scores = torch.cat([scores, scores_z], dim=0)
+        else:
+            all_cands_s1 = candidates_s1
+            all_x0_s1 = x0_s1
+            all_scores = scores
+
+        top_s2_idx = torch.argsort(all_scores)[:n_stage2]
+        candidates_s2 = all_cands_s1[top_s2_idx]
+        x0_s2 = all_x0_s1[top_s2_idx]
 
     # Stage 3: Short-horizon viability filter and batched multi-start optimization
     n_stage3 = min(max(int(num_gradient_starts), 1), n_stage2)
@@ -399,6 +545,7 @@ def run_elimination_funnel(
     x0_candidates_s3 = x0_s2[top_s3_idx].clone()
 
     if (any_tunable or optimize_hidden_x0) and gradient_steps > 0:
+        pre_adam_s3 = _project_tunable_params(brick, candidates_s3.clone(), default_p, custom_bounds=custom_bounds)
         theta_opt = candidates_s3.clone().detach().requires_grad_(any_tunable and brick.param_dim > 0)
         opt_vars: list[torch.Tensor] = []
         if any_tunable and brick.param_dim > 0:
@@ -533,6 +680,7 @@ def run_elimination_funnel(
                                 sp = brick.state_specs[s_i]
                                 hidden_init[:, hid_pos].clamp_(min=sp.homeostatic_min, max=sp.homeostatic_max)
 
+        record_simulation_activity(adjoint_gradient_passes=int(gradient_steps) * int(n_stage3))
         candidates_s3 = _project_tunable_params(brick, theta_opt.detach(), default_p, custom_bounds=custom_bounds)
         x0_candidates_s3 = _assemble_batch_x0(hidden_init.detach() if hidden_init is not None else None)
 
@@ -540,10 +688,18 @@ def run_elimination_funnel(
         if full_state_observed and dx_dt_obs is not None:
             flat_x_all = obs_traj.reshape(n_exp * t_steps, brick.state_dim)
             flat_dx_all = dx_dt_obs.reshape(n_exp * t_steps, brick.state_dim)
+            candidates_s3 = candidates_s3.clone()
             vf_s3 = torch.zeros((n_stage3,), dtype=torch.float64, device=device)
             for k_i in range(n_stage3):
                 p_k = candidates_s3[k_i : k_i + 1].expand(flat_x_all.shape[0], -1)
-                vf_s3[k_i] = torch.mean((brick.flow(flat_x_all, p_k) - flat_dx_all) ** 2)
+                mse_post = torch.mean((brick.flow(flat_x_all, p_k) - flat_dx_all) ** 2)
+                p_pre = pre_adam_s3[k_i : k_i + 1].expand(flat_x_all.shape[0], -1)
+                mse_pre = torch.mean((brick.flow(flat_x_all, p_pre) - flat_dx_all) ** 2)
+                if torch.isfinite(mse_pre) and (not torch.isfinite(mse_post) or mse_pre < mse_post):
+                    candidates_s3[k_i] = pre_adam_s3[k_i]
+                    vf_s3[k_i] = mse_pre
+                else:
+                    vf_s3[k_i] = mse_post
             vf_s3 = torch.where(torch.isfinite(vf_s3), vf_s3, torch.full_like(vf_s3, 1e18))
             top_lm_idx = int(torch.argmin(vf_s3).item())
             polished_top = _levenberg_marquardt_vector_field_polish(
@@ -555,7 +711,6 @@ def run_elimination_funnel(
                 custom_bounds=custom_bounds,
                 max_iters=8,
             )
-            candidates_s3 = candidates_s3.clone()
             candidates_s3[top_lm_idx] = polished_top[0]
 
     # Stage 4: Full-horizon rollout verification and Layer 1 thermodynamic audit

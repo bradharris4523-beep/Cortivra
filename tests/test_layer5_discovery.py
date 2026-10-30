@@ -769,3 +769,267 @@ def test_autonomous_from_scratch_coupled_system_discovery() -> None:
     assert auto_rep.archetype.max_polynomial_degree == 2
 
 
+def test_differential_residual_inversion_for_3d_unseen_perturber_and_onsager_basis() -> None:
+    """
+    Verify Upgrade 4 (Universal Differential Residual Trajectory Inversion / "Neptune Inverter")
+    and Upgrade 3c (3D Euclidean & Onsager Cross-Coupling Basis Generation):
+      1. `invert_residual_for_unseen_perturber` reconstructs the hidden trajectory `z_hat(t)`,
+         its governing ODE, its 3D line-of-action unit vector `u_hat(t)`, and its inverse-square
+         distance profile `r_hat(t)` from a 3D spatial brick's velocity residual.
+      2. `generate_symbolic_basis_library` generates off-diagonal `(i, j)` Onsager dissipative
+         coupling candidates and 3D `dist3d` / `inv_dist_pow` pairwise basis terms.
+    """
+    from cortivra.layer1_axioms.hamiltonian import SpatialNode3DSpec
+    from cortivra.layer1_axioms.units import J, m
+    from cortivra.layer5_discovery.latent_discovery import invert_residual_for_unseen_perturber
+
+    orb_spec = SymbolicSystemSpec(
+        name="orbital_2body_3d",
+        domain="astrophysics",
+        state_specs=[
+            StateVarSpec("rx", m, default_value=2.0),
+            StateVarSpec("ry", m, default_value=0.0),
+            StateVarSpec("rz", m, default_value=0.0),
+            StateVarSpec("bx", m, default_value=0.0),
+            StateVarSpec("by", m, default_value=3.0),
+            StateVarSpec("bz", m, default_value=0.0),
+        ],
+        param_specs=[
+            ParamSpec("k_g", J / (m**2), default_value=1.0),
+            ParamSpec("g_ons", (m**2) / (J * s), default_value=0.1, min_value=0.0),
+        ],
+        time_unit=s,
+        energy_unit=J,
+        hamiltonian_expr="0.5 * k_g * (rx**2 + ry**2 + rz**2 + bx**2 + by**2 + bz**2)",
+        dissipation_diag_exprs=("g_ons", "g_ons", "g_ons", "g_ons", "g_ons", "g_ons"),
+        spatial_nodes_3d=(
+            SpatialNode3DSpec("body_a", ("rx", "ry", "rz")),
+            SpatialNode3DSpec("body_b", ("bx", "by", "bz")),
+        ),
+    )
+    orb_brick = compile_symbolic_system(orb_spec)
+    t_grid = torch.linspace(0.0, 2.0, 40, dtype=torch.float64)
+    states = torch.stack(
+        [
+            2.0 * torch.cos(t_grid),
+            2.0 * torch.sin(t_grid),
+            0.2 * t_grid,
+            0.5 * torch.sin(t_grid),
+            3.0 * torch.cos(t_grid),
+            -0.1 * t_grid,
+        ],
+        dim=-1,
+    )
+    p_base = orb_brick.default_params(batch_size=1, dtype=torch.float64)
+
+    # Synthetic 3D perturbation residual pointing toward an unseen 3D body along direction (0.6, 0.8, 0.0)
+    osc_mode = torch.cos(3.5 * t_grid)
+    res_flow = torch.zeros_like(states)
+    res_flow[:, 0] = 0.6 * osc_mode
+    res_flow[:, 1] = 0.8 * osc_mode
+    res_flow[:, 2] = 0.0
+
+    inv_rep = invert_residual_for_unseen_perturber(
+        base_brick=orb_brick,
+        observed_states=states,
+        residual_flow=res_flow,
+        dt=float((t_grid[1] - t_grid[0]).item()),
+        target_state_index=0,
+    )
+    assert inv_rep.dominant_mode_type == "oscillatory_2d"
+    assert inv_rep.latent_ode_r2 > 0.95
+    assert inv_rep.estimated_3d_line_of_action is not None
+    assert inv_rep.estimated_3d_line_of_action.shape == (40, 3)
+    assert inv_rep.estimated_inverse_square_distance is not None
+    # At t=0, osc_mode = 1.0 > 0, so line of action is exactly (0.6, 0.8, 0.0)
+    assert torch.allclose(
+        inv_rep.estimated_3d_line_of_action[0],
+        torch.tensor([0.6, 0.8, 0.0], dtype=torch.float64),
+        atol=1e-6,
+    )
+
+    # Verify 3D pairwise Hamiltonian potential basis terms and off-diagonal Onsager dissipative basis terms
+    lib_h = generate_symbolic_basis_library(
+        brick=orb_brick,
+        states=states,
+        base_params=p_base,
+        thermodynamic_slot="hamiltonian_potential",
+        include_rational_primitives=False,
+    )
+    h_ids = {t.term_id for t in lib_h.terms}
+    assert any("dist3d" in tid or "inv_r3d" in tid for tid in h_ids)
+
+    lib_diss = generate_symbolic_basis_library(
+        brick=orb_brick,
+        states=states,
+        base_params=p_base,
+        thermodynamic_slot="passive_dissipative",
+        include_rational_primitives=False,
+    )
+    assert any(isinstance(t.target_key, tuple) for t in lib_diss.terms)
+
+
+def test_inverse_symbolic_mechanism_invention_from_pontryagin_control() -> None:
+    """
+    Verify Horizon 1 (`synthesize_symbolic_feedback_mechanism`):
+    When `base_brick` has frozen/exhausted parameters that decay state `x` to `0.0` instead of
+    the desired homeostatic target `x_target = 2.0`, `synthesize_symbolic_feedback_mechanism`:
+        1. Computes the optimal Pontryagin control waveform `u^*(t)`.
+        2. Projects `u^*(t)` onto Layer 5's Symbolic Basis Library to invent a closed-form
+           feedback mechanism `u_catalyst(x, theta_new)`.
+        3. Compiles and polishes an autonomous closed-loop `LawBrick` (`u_ext = 0`) that slashes
+           target loss by > 90% while passing `audit_law_brick`.
+    """
+    from cortivra.layer5_discovery import synthesize_symbolic_feedback_mechanism
+
+    spec = SymbolicSystemSpec(
+        name="unactuated_decay_pathway",
+        domain="chemistry",
+        state_specs=[
+            StateVarSpec("x", DIMENSIONLESS, default_value=0.4, homeostatic_min=0.0, homeostatic_max=10.0),
+        ],
+        param_specs=[
+            ParamSpec("k_leak", DIMENSIONLESS / s, default_value=1.0, min_value=0.1, max_value=5.0, tunable=False),
+        ],
+        time_unit=s,
+        energy_unit=DIMENSIONLESS,
+        hamiltonian_expr="0.5 * (x^2)",
+        dissipation_diag_exprs=["k_leak"],
+    )
+    base_brick = compile_symbolic_system(spec)
+    x0 = torch.tensor([[0.4]], dtype=torch.float64)
+    p_base = base_brick.default_params(batch_size=1, dtype=torch.float64)
+
+    def _target_loss(traj: torch.Tensor) -> torch.Tensor:
+        if traj.ndim == 3:
+            return torch.mean((traj[:, -5:, 0] - 2.0) ** 2)
+        return torch.mean((traj[-5:, 0] - 2.0) ** 2)
+
+    inv_rep = synthesize_symbolic_feedback_mechanism(
+        base_brick=base_brick,
+        initial_state=x0,
+        base_params=p_base,
+        dt=0.05,
+        num_steps=30,
+        target_loss_fn=_target_loss,
+        max_control_amplitude=5.0,
+        control_optimization_steps=30,
+        polish_optimization_steps=30,
+    )
+    assert inv_rep.audit_certificate.passed_all
+    assert inv_rep.viable_across_trajectory
+    assert inv_rep.autonomous_closed_loop_loss < inv_rep.baseline_target_loss * 0.10
+    assert inv_rep.loss_reduction_ratio > 10.0
+    assert "u_x(x) =" in inv_rep.invented_expression
+
+
+def test_variational_bump_weak_form_and_multi_experiment_joint_discovery() -> None:
+    """
+    Verify the Adversarial Hardening upgrades in Layer 5:
+        1. `build_variational_bump_integral_system` & `discover_and_compile_law` under additive
+           state measurement noise (`observed_dx_dt=None`): integration-by-parts against compactly
+           supported $C^4$ polynomial bump test functions $\\phi(t) = (1 - \\tau^2)^4$ plus
+           Savitzky-Golay denoising recovers the exact missing nonlinear law (`diss_1_p_sq`)
+           without ever needing clean ground-truth derivatives.
+        2. Multi-Experiment / Multi-Initial-Condition Joint Discovery (`[NumExperiments, TimeSteps, StateDim]`):
+           given a 3D tensor `[3, 26, 2]` of 3 distinct experimental trajectories, `discover_and_compile_law`
+           and `solve_sparse_pareto_front` respect experiment boundaries (`num_experiments=3`) so no
+           sliding integral window ever crosses from the end of experiment `e` into the start of `e+1`,
+           recovering the exact missing law with `out_of_sample_r2 > 0.98`.
+    """
+    from cortivra.layer5_discovery import build_variational_bump_integral_system
+
+    base = CanonicalHamiltonianBrick(k_default=1.5, m_default=1.0, damping_default=0.05)
+    true_patched = compile_residual_patch_brick(
+        name="true_cubic_damped_oscillator",
+        base_brick=base,
+        patch_param_specs=[ParamSpec("gamma_nl", base.state_specs[1].unit, default_value=0.6, min_value=0.0)],
+        thermodynamic_mode="passive_dissipative",
+        patch_expressions={1: "gamma_nl * p^2"},
+    )
+    p_true = torch.tensor([[1.5, 1.0, 0.05, 0.6]], dtype=torch.float64)
+    dt = 0.025
+
+    # Part 1: Noisy state-only trajectory (observed_dx_dt=None)
+    x0_single = torch.tensor([[1.6, 0.9]], dtype=torch.float64)
+    gt_single = rollout_trajectories(true_patched, x0_single, p_true, dt=dt, num_steps=64, integrator="rk4")
+    clean_states = gt_single.states[0]  # [65, 2]
+
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(777)
+    noisy_states = clean_states + 0.025 * torch.randn(clean_states.shape, generator=gen, dtype=torch.float64)
+
+    p_base = torch.tensor([[1.5, 1.0, 0.05]], dtype=torch.float64)
+    base_flow_on_noisy = base.flow(noisy_states, p_base.expand(noisy_states.shape[0], -1))
+    lib_noisy = generate_symbolic_basis_library(
+        brick=base,
+        states=noisy_states,
+        base_params=p_base,
+        thermodynamic_slot="passive_dissipative",
+        affected_state_indices=[1],
+        include_rational_primitives=False,
+    )
+    phi_cols = torch.stack([t.flow_column for t in lib_noisy.terms], dim=-1)
+    phi_bump, y_bump = build_variational_bump_integral_system(
+        flow_columns=phi_cols,
+        target_residual=torch.zeros_like(noisy_states),
+        dt=dt,
+        window_steps=10,
+        bump_degree=4,
+        states=noisy_states,
+        base_flow=base_flow_on_noisy,
+    )
+    assert phi_bump.shape[0] > 10 and phi_bump.shape[1] == len(lib_noisy.terms)
+    assert y_bump.shape == (phi_bump.shape[0],)
+
+    disc_noisy = discover_and_compile_law(
+        base_brick=base,
+        observed_states=noisy_states,
+        dt=dt,
+        observed_dx_dt=None,  # Force automatic noise detection + Savitzky-Golay + Variational Bump Weak Form!
+        max_active_terms=1,
+        custom_base_bounds={"k": (1.5, 1.5), "m": (1.0, 1.0), "damping": (0.05, 0.05)},
+    )
+    assert disc_noisy.discovery_triggered
+    assert disc_noisy.winning_candidate is not None
+    assert "diss_1_p_sq" in disc_noisy.winning_candidate.active_term_ids
+    assert disc_noisy.audit_certificate.passed_all
+
+    # Part 2: 3D Multi-Experiment / Multi-Initial-Condition Ensemble [3, 26, 2]
+    x0_ensemble = torch.tensor(
+        [
+            [1.6, 0.0],
+            [0.0, 1.5],
+            [-1.3, -0.8],
+        ],
+        dtype=torch.float64,
+    )
+    gt_ens = rollout_trajectories(
+        true_patched,
+        x0_ensemble,
+        p_true.expand(3, -1),
+        dt=dt,
+        num_steps=25,
+        integrator="rk4",
+    )
+    ens_states = gt_ens.states  # [3, 26, 2]
+    assert ens_states.shape == (3, 26, 2)
+
+    disc_ens = discover_and_compile_law(
+        base_brick=base,
+        observed_states=ens_states,
+        dt=dt,
+        observed_dx_dt=None,
+        max_active_terms=1,
+        custom_base_bounds={"k": (1.5, 1.5), "m": (1.0, 1.0), "damping": (0.05, 0.05)},
+    )
+    assert disc_ens.discovery_triggered
+    assert disc_ens.winning_candidate is not None
+    assert "diss_1_p_sq" in disc_ens.winning_candidate.active_term_ids
+    assert disc_ens.out_of_sample_r2 > 0.98
+    assert disc_ens.audit_certificate.passed_all
+
+
+
+
+

@@ -29,6 +29,7 @@ def serialize_trace_to_dict(
         "merkle_integrity_verified": dag.verify_merkle_integrity(),
         "num_nodes": len(dag.nodes),
         "total_duration_ms": round(total_ms, 3),
+        "simulation_counters": dag.simulation_counters.to_dict(),
         "nodes": [n.to_dict() for n in dag.nodes],
         "contradiction_report": (
             contradiction_report.to_dict() if contradiction_report is not None else None
@@ -74,12 +75,22 @@ def format_forensic_xray_report(
     """
     total_ms = sum(n.duration_ms for n in dag.nodes)
     integrity = dag.verify_merkle_integrity()
+    sc = dag.simulation_counters
     lines: list[str] = [
         f"# Forensic Scientific Flight Recorder X-Ray: `{dag.session_id}`",
         (
             f"**Question:** {dag.question or 'N/A'} | **Causal Nodes:** `{len(dag.nodes)}` | "
             f"**Total Time:** `{total_ms:.2f} ms` | **Merkle Root:** `{dag.merkle_root_hash[:16]}...` "
             f"(Verified=`{integrity}`)"
+        ),
+        (
+            f"**Hardware Simulation Telemetry:** ODE Rollout Calls=`{sc.ode_rollout_calls}` | "
+            f"Parallel Trajectories Integrated=`{sc.trajectories_integrated}` | "
+            f"State-Step Transitions=`{sc.integration_steps_executed}` | "
+            f"Sobol QMC Universes=`{sc.sobol_qmc_universes_sampled}` | "
+            f"Newton-Jacobian Solves=`{sc.newton_jacobian_solves}` | "
+            f"Adjoint Gradient Passes=`{sc.adjoint_gradient_passes}` | "
+            f"Integrators=`{sc.integrator_usage}`"
         ),
         "",
         "## 1. Causal Computation Graph Timeline",

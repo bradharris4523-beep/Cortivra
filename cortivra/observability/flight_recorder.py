@@ -124,6 +124,26 @@ def _compute_node_merkle_hash(
 
 
 @dataclass
+class SimulationTelemetryCounters:
+    """
+    Real-time hardware simulation, Quasi-Monte Carlo (Sobol) universe sampling,
+    batched ODE rollout, Newton-Raphson Jacobian, and adjoint backpropagation counters.
+    """
+
+    ode_rollout_calls: int = 0
+    trajectories_integrated: int = 0
+    integration_steps_executed: int = 0
+    sobol_qmc_universes_sampled: int = 0
+    newton_jacobian_solves: int = 0
+    adjoint_gradient_passes: int = 0
+    stochastic_langevin_trajectories: int = 0
+    integrator_usage: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class CausalTraceDAG:
     """
     Directed Acyclic Causal Computation Graph with SHA-256 Merkle provenance chain.
@@ -133,6 +153,9 @@ class CausalTraceDAG:
     question: str = ""
     created_at_epoch_s: float = field(default_factory=time.time)
     nodes: list[CausalTraceNode] = field(default_factory=list)
+    simulation_counters: SimulationTelemetryCounters = field(
+        default_factory=SimulationTelemetryCounters
+    )
     _node_index: dict[str, CausalTraceNode] = field(default_factory=dict, repr=False)
 
     def add_node(self, node: CausalTraceNode) -> CausalTraceNode:
@@ -216,7 +239,7 @@ def summarize_singular_spectrum(
     Compute the singular value spectrum, condition number, effective numerical rank,
     spectral gap ratio, and nullspace dimension of a tensor operator or singular value vector.
     """
-    t = matrix_or_svals.detach().to(torch.float64)
+    t = torch.nan_to_num(matrix_or_svals.detach().to(torch.float64), nan=0.0, posinf=1e6, neginf=-1e6)
     if t.ndim == 1:
         s_vals = torch.sort(torch.abs(t), descending=True).values
         shape = matrix_shape if matrix_shape is not None else (int(t.numel()), int(t.numel()))
@@ -501,3 +524,34 @@ def trace_span(
         return
     with rec.span(layer=layer, operation=operation, target_name=target_name, parent_ids=parent_ids) as node:
         yield node
+
+
+def record_simulation_activity(
+    *,
+    ode_rollout_calls: int = 0,
+    trajectories_integrated: int = 0,
+    integration_steps_executed: int = 0,
+    sobol_qmc_universes_sampled: int = 0,
+    newton_jacobian_solves: int = 0,
+    adjoint_gradient_passes: int = 0,
+    stochastic_langevin_trajectories: int = 0,
+    integrator: str | None = None,
+) -> None:
+    """
+    Increment ambient hardware simulation and QMC universe counters on the active `FlightRecorder`.
+    Zero-overhead no-op when no `FlightRecorder` session is active.
+    """
+    rec = _ACTIVE_RECORDER.get()
+    if rec is None:
+        return
+    c = rec.dag.simulation_counters
+    c.ode_rollout_calls += int(ode_rollout_calls)
+    c.trajectories_integrated += int(trajectories_integrated)
+    c.integration_steps_executed += int(integration_steps_executed)
+    c.sobol_qmc_universes_sampled += int(sobol_qmc_universes_sampled)
+    c.newton_jacobian_solves += int(newton_jacobian_solves)
+    c.adjoint_gradient_passes += int(adjoint_gradient_passes)
+    c.stochastic_langevin_trajectories += int(stochastic_langevin_trajectories)
+    if integrator:
+        c.integrator_usage[integrator] = c.integrator_usage.get(integrator, 0) + 1
+

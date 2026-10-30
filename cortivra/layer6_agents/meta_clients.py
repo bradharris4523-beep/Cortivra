@@ -174,6 +174,48 @@ ROLE_SYSTEM_PROMPTS: dict[AgentRole, str] = {
     ),
 }
 
+WORLD_MODEL_SYNTHESIS_PROTOCOL: str = (
+    "\nUNIVERSAL N-COMPARTMENT CAUSAL BLAST-RADIUS & BYSTANDER SHIELD PROTOCOL FOR 'synthesize_world_model' (ZERO DOMAIN ASSUMPTIONS):\n"
+    "CRITICAL EFFICIENCY & ANTI-TEMPLATE RULE: Do NOT restate these rules or write long prose in your thinking. "
+    "Immediately choose N >= 5 coupled state variables (5 to 7 compartments) covering the full causal blast radius, and output the JSON object directly. "
+    "AUTONOMOUS FAILURE-MODE & BYSTANDER DEDUCTION: Even when the user's prompt is a short, naive goal that does NOT mention any side effects or bystanders to avoid, "
+    "you MUST autonomously deduce the real physical failure modes, local stresses, and vulnerable neighboring bystander compartments in that domain and construct all N >= 5 compartments with domain-authentic names. "
+    "NEVER assign identical default_value numbers across k_1..k_N, g_1..g_N, or u_1..u_N; every compartment MUST have a distinct, physically authentic stiffness, relaxation rate, and drive reflecting its real physical timescale and capacity in this domain.\n"
+    "Construct a nonlinear N-state Port-Hamiltonian dynamical system dx/dt = (J(x) - R(x)) grad H(x) + u(x) with N >= 5:\n"
+    "  1. AXIOM I, II & III (N >= 5 Coupled Physical States in 'state_specs', all with 'unit': '1'):\n"
+    "     - State 0 (Primary Target Order Parameter x_1): primary physical mechanism targeted by the hypothesis "
+    "(choose domain-authentic degraded 'default_value' in [1.8, 4.2], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'primary_target').\n"
+    "     - State 1 (Local Stress / Entropic Wear x_2): direct local thermodynamic, oxidative, or mechanical stress inside the primary compartment "
+    "(choose 'default_value' in [0.7, 1.5], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'local_stress').\n"
+    "     - State 2 (Energetic / Resource Supply Reservoir x_3): energetic carrier, fuel manifold, or potential reservoir feeding the system "
+    "(choose 'default_value' in [0.6, 1.4], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'energy_reservoir').\n"
+    "     - State 3 (Co-Located Bystander Compartment x_4): neighboring cell type, adjacent mechanical component (e.g. bearing/seal/adjacent tissue), "
+    "or parallel subsystem sharing the physical medium that must be shielded from off-target friendly fire "
+    "(choose 'default_value' in [0.8, 1.3], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'co_located_bystander').\n"
+    "     - State 4 (Downstream Functional Receiver x_5): downstream organ, neural pathway, structural frame, or exhaust stage receiving output flux from State 0 "
+    "(choose 'default_value' in [0.8, 1.3], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'downstream_receiver').\n"
+    "     - States 5..N-1 (Optional additional coupled bystanders or downstream stages x_6..x_N if the causal network requires N > 5).\n"
+    "  2. AXIOM III (Heterogeneous Domain-Specific Parameters in 'param_specs'):\n"
+    "     - Quadratic stiffnesses in H: k_1 (tunable: true), k_2 (tunable: true), k_3..k_N (tunable: false) with 'unit': '1', min_value 0.1, max_value 10.0, and DISTINCT 'default_value' in [0.5, 3.8] reflecting each compartment's physical rigidity/capacitance.\n"
+    "     - Dissipation/clearance rates: g_1 (tunable: true), g_2 (tunable: true), g_3..g_N (tunable: false) with 'unit': '1/s', min_value 0.05, max_value 10.0, and DISTINCT 'default_value' in [0.25, 2.2] reflecting each compartment's physical turnover/damping rate.\n"
+    "     - Onsager cross-coupling rate: g_cpl (tunable: true, 'unit': '1/s', choose 'default_value' in [0.08, 0.45], min_value: 0.0, max_value: 5.0).\n"
+    "     - Conservative skew-symmetric routing rate (include for oscillatory/mechanical/wave/feedback systems): j_osc (tunable: true, 'unit': '1/s', 'default_value' in [0.05, 0.6], min_value: 0.0, max_value: 5.0).\n"
+    "     - Basal/active drives: u_1 (tunable: true), u_2..u_N (tunable: false) with 'unit': '1/s', min_value 0.0, max_value 10.0, and DISTINCT 'default_value' in [0.3, 2.4].\n"
+    "  3. AXIOM IV (Nonlinear Mechanistic Kinetics & N-Node 3D Compartment Geometry):\n"
+    "     - 'name': descriptive snake_case model name, 'domain': scientific domain string, 'time_unit': 's', 'energy_unit': '1'\n"
+    "     - 'hamiltonian_expr': sum of '0.5 * k_i * x_i**2' across all N states (using your exact N state and stiffness names)\n"
+    "     - 'dissipation_diag_exprs': length-N list with domain-specific nonlinear state-modulated clearance on State 0 and State 1 (choose cooperativity power 2 or 3 and coupling strength matching the physics)\n"
+    "     - 'dissipation_coupling_exprs': symmetric Onsager cross-dissipation dict coupling State 0 across the blast radius {'0,1': '...', '0,2': '...', '0,3': '...', '0,4': '...'}\n"
+    "     - 'skew_routing_exprs': optional skew-symmetric conservative energy exchange dict e.g. {'0,1': 'j_osc'} when gyroscopic or oscillatory feedback is present\n"
+    "     - 'external_drive_exprs': length-N list with Michaelis-Menten energetic saturation & Hill feedback inhibition on State 0 (choose saturation constant and Hill exponent 2, 3, or 4 matching the physical mechanism)\n"
+    "     - 'spatial_nodes_3d': list of N 3D compartments (one per state) [{'node_id': str, 'fixed_position_m': [x, y, z], "
+    "'volume_m3': float, 'radius_m': float, 'associated_state_names': [str]}].\n"
+    "  - Allowed algebraic operators: '+', '-', '*', '/', '**'. All symbols in expressions MUST be in 'state_specs' or 'param_specs'.\n"
+    "Return strictly valid JSON with keys: 'candidate_spec', 'target_state_objective' (dict mapping primary target "
+    "state name to a domain-appropriate healthy numeric target value in [0.5, 1.2]), and 'inverse_mode' (default 'counterfactual_intervention'; "
+    "use 'symbolic_mechanism_invention' only if asked to invent a feedback catalyst)."
+)
+
 
 @dataclass(frozen=True)
 class ProviderEndpointConfig:
@@ -208,7 +250,7 @@ class LLMInferenceRequest:
     system_prompt: str
     user_prompt: str
     temperature: float = 0.1
-    max_tokens: int = 1024
+    max_tokens: int = 16384
     require_json: bool = True
     preferred_provider: ProviderName | None = None
 
@@ -350,6 +392,8 @@ class MathematicalEpistemicPolicy:
 
         if task_type == "symbolic_self_repair":
             return MathematicalEpistemicPolicy._handle_symbolic_repair(payload)
+        if task_type == "synthesize_world_model":
+            return MathematicalEpistemicPolicy._handle_world_model_synthesis(payload)
         if task_type == "audit_operator_or_intervention":
             return MathematicalEpistemicPolicy._handle_spark_audit(payload)
         if task_type == "adversarial_red_team_review":
@@ -357,6 +401,452 @@ class MathematicalEpistemicPolicy:
         if task_type == "synthesize_dossier_narrative":
             return MathematicalEpistemicPolicy._handle_dossier_narrative(payload)
         return MathematicalEpistemicPolicy._handle_action_selection(payload)
+
+    @staticmethod
+    def _handle_world_model_synthesis(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """
+        Synthesize a dimensionally homogeneous Port-Hamiltonian `SymbolicSystemSpec` dictionary,
+        `target_state_objective`, `inverse_mode`, and optional `unmodeled_anomaly_patch` from an
+        open-ended natural-language scientific hypothesis across any physical, chemical,
+        biological, neuroscience, aerospace, thermodynamic, or quantum domain.
+        """
+        question = str(payload.get("question", "")).strip()
+        q_lc = question.lower()
+        domain = str(payload.get("domain", "multiphysics")).strip() or "multiphysics"
+
+        inv_mode = "counterfactual_intervention"
+        anomaly_patch: dict[str, Any] | None = None
+
+        is_locked_invention = any(
+            k in q_lc
+            for k in (
+                "invent",
+                "catalyst",
+                "synthetic feedback",
+                "locked",
+                "irreversible",
+                "unactuated",
+                "frozen",
+                "closed-loop controller",
+                "gene circuit",
+            )
+        )
+        is_anomaly_discovery = any(
+            k in q_lc
+            for k in (
+                "anomaly",
+                "unexplained",
+                "missing law",
+                "missing mechanism",
+                "discover",
+                "faster than linear",
+                "nonlinear decay",
+                "why is",
+                "unmodeled",
+            )
+        )
+
+        if is_locked_invention:
+            spec_dict: dict[str, Any] = {
+                "name": "synthesized_locked_degenerative_pathway",
+                "domain": domain if domain != "multiphysics" else "biochemistry_and_synthetic_biology",
+                "time_unit": "s",
+                "energy_unit": "1",
+                "state_specs": [
+                    {
+                        "name": "x_metabolite",
+                        "unit": "1",
+                        "default_value": 0.4,
+                        "homeostatic_min": 0.0,
+                        "homeostatic_max": 10.0,
+                        "hard_min": 0.0,
+                    },
+                ],
+                "param_specs": [
+                    {
+                        "name": "k_degrade",
+                        "unit": "1/s",
+                        "default_value": 1.0,
+                        "min_value": 0.1,
+                        "max_value": 5.0,
+                        "tunable": False,
+                    },
+                ],
+                "hamiltonian_expr": "0.5 * (x_metabolite**2)",
+                "dissipation_diag_exprs": ["k_degrade"],
+                "external_drive_exprs": ["0.0"],
+                "spatial_nodes_3d": [
+                    {
+                        "node_id": "cytoplasmic_reactor_core_3d",
+                        "fixed_position_m": [0.0, 0.0, 0.0],
+                        "volume_m3": 4.188e-15,
+                        "radius_m": 1.0e-5,
+                        "associated_state_names": ["x_metabolite"],
+                    }
+                ],
+            }
+            target_obj: dict[str, float] = {"x_metabolite": 2.0}
+            inv_mode = "symbolic_mechanism_invention"
+        elif any(
+            k in q_lc
+            for k in ("orbit", "space", "gravity", "neptune", "planet", "3d", "thrust", "fuel", "satellite", "kepler")
+        ):
+            spec_dict = {
+                "name": "synthesized_3d_orbital_energetics_system",
+                "domain": domain if domain != "multiphysics" else "astrophysics_and_aerospace",
+                "time_unit": "s",
+                "energy_unit": "J",
+                "state_specs": [
+                    {"name": "rx", "unit": "m", "default_value": 2.0, "homeostatic_min": -20.0, "homeostatic_max": 20.0},
+                    {"name": "ry", "unit": "m", "default_value": 1.5, "homeostatic_min": -20.0, "homeostatic_max": 20.0},
+                    {"name": "rz", "unit": "m", "default_value": 0.8, "homeostatic_min": -20.0, "homeostatic_max": 20.0},
+                ],
+                "param_specs": [
+                    {"name": "k_grav", "unit": "J/m**2", "default_value": 1.5, "min_value": 0.1, "max_value": 20.0, "tunable": True},
+                    {"name": "g_drag", "unit": "m**2/(J*s)", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": True},
+                    {"name": "u_thrust_x", "unit": "m/s", "default_value": 0.9, "min_value": -10.0, "max_value": 10.0, "tunable": True},
+                ],
+                "hamiltonian_expr": "0.5 * k_grav * (rx**2 + ry**2 + rz**2)",
+                "dissipation_diag_exprs": ["g_drag", "g_drag", "g_drag"],
+                "skew_routing_exprs": {"0,1": "0.25 * g_drag"},
+                "external_drive_exprs": ["u_thrust_x", "0.0", "0.0"],
+                "spatial_nodes_3d": [
+                    {
+                        "node_id": "craft_3d",
+                        "position_state_names": ["rx", "ry", "rz"],
+                        "fixed_position_m": [2.0, 1.5, 0.8],
+                        "volume_m3": 1.0,
+                        "radius_m": 0.5,
+                        "associated_state_names": ["rx", "ry", "rz"],
+                    },
+                ],
+            }
+            target_obj = {"rx": 0.5}
+        elif any(
+            k in q_lc
+            for k in (
+                "neuron",
+                "membrane",
+                "voltage",
+                "depolariz",
+                "hyperpolariz",
+                "calcium",
+                "ion channel",
+                "ionic",
+                "channel",
+                "synap",
+                "cardiac",
+                "pacemaker",
+                "cochlear",
+                "excitotoxic",
+            )
+        ):
+            spec_dict = {
+                "name": "synthesized_bioelectrical_calcium_homeostasis_system",
+                "domain": domain if domain != "multiphysics" else "electrophysiology_and_neurobiology",
+                "time_unit": "s",
+                "energy_unit": "J",
+                "state_specs": [
+                    {
+                        "name": "V_m",
+                        "unit": "V",
+                        "default_value": 2.2,
+                        "homeostatic_min": -8.0,
+                        "homeostatic_max": 8.0,
+                    },
+                    {
+                        "name": "Ca_cyt",
+                        "unit": "mol/m**3",
+                        "default_value": 1.15,
+                        "homeostatic_min": 0.05,
+                        "homeostatic_max": 6.0,
+                        "hard_min": 0.0,
+                    },
+                ],
+                "param_specs": [
+                    {
+                        "name": "k_cap",
+                        "unit": "J/V**2",
+                        "default_value": 1.0,
+                        "min_value": 0.2,
+                        "max_value": 10.0,
+                        "tunable": False,
+                    },
+                    {
+                        "name": "k_ca_buf",
+                        "unit": "J*m**6/mol**2",
+                        "default_value": 1.0,
+                        "min_value": 0.2,
+                        "max_value": 10.0,
+                        "tunable": False,
+                    },
+                    {
+                        "name": "g_leak_v",
+                        "unit": "V**2/(J*s)",
+                        "default_value": 1.0,
+                        "min_value": 0.1,
+                        "max_value": 10.0,
+                        "tunable": False,
+                    },
+                    {
+                        "name": "g_pump_ca",
+                        "unit": "mol**2/(J*m**6*s)",
+                        "default_value": 1.2,
+                        "min_value": 0.1,
+                        "max_value": 10.0,
+                        "tunable": False,
+                    },
+                    {
+                        "name": "u_shared_drive",
+                        "unit": "V/s",
+                        "default_value": 1.0,
+                        "min_value": 0.0,
+                        "max_value": 6.0,
+                        "tunable": True,
+                    },
+                    {
+                        "name": "u_selective_k",
+                        "unit": "V/s",
+                        "default_value": 1.2,
+                        "min_value": -4.0,
+                        "max_value": 6.0,
+                        "tunable": True,
+                    },
+                    {
+                        "name": "c_ca_couple",
+                        "unit": "mol/(m**3*V)",
+                        "default_value": 1.2,
+                        "min_value": 0.1,
+                        "max_value": 5.0,
+                        "tunable": False,
+                    },
+                ],
+                "hamiltonian_expr": "0.5 * k_cap * (V_m**2) + 0.5 * k_ca_buf * (Ca_cyt**2)",
+                "dissipation_diag_exprs": ["g_leak_v", "g_pump_ca"],
+                "external_drive_exprs": ["u_shared_drive + u_selective_k", "c_ca_couple * u_shared_drive"],
+                "spatial_nodes_3d": [
+                    {
+                        "node_id": "somatic_membrane_shell_3d",
+                        "fixed_position_m": [0.0, 0.0, 0.0],
+                        "volume_m3": 4.188e-15,
+                        "radius_m": 1.0e-5,
+                        "associated_state_names": ["V_m"],
+                    },
+                    {
+                        "node_id": "cytosolic_calcium_microdomain_3d",
+                        "fixed_position_m": [2.5e-6, 0.0, 0.0],
+                        "volume_m3": 5.236e-16,
+                        "radius_m": 5.0e-6,
+                        "associated_state_names": ["Ca_cyt"],
+                    },
+                ],
+            }
+            target_obj = {"V_m": 0.5}
+            if is_anomaly_discovery:
+                anomaly_patch = {
+                    "thermodynamic_mode": "passive_dissipative",
+                    "patch_param": {"name": "g_kv_cubic", "unit": "1/(J*s)", "default_value": 0.45, "min_value": 0.0},
+                    "patch_expressions": {"0": "g_kv_cubic * (V_m**2)"},
+                }
+        elif any(
+            k in q_lc
+            for k in ("thermal", "heat", "entropy", "temperature", "engine", "carnot", "battery", "runaway", "cooling")
+        ):
+            spec_dict = {
+                "name": "synthesized_generic_thermo_mechanical_system",
+                "domain": domain if domain != "multiphysics" else "thermodynamics_and_energy",
+                "time_unit": "s",
+                "energy_unit": "J",
+                "state_specs": [
+                    {"name": "q_disp", "unit": "m", "default_value": 1.8, "homeostatic_min": -10.0, "homeostatic_max": 10.0},
+                    {"name": "p_mom", "unit": "kg*m/s", "default_value": 0.0, "homeostatic_min": -15.0, "homeostatic_max": 15.0},
+                    {"name": "E_therm", "unit": "J", "default_value": 1.0, "homeostatic_min": 0.0, "homeostatic_max": 50.0, "hard_min": 0.0},
+                ],
+                "param_specs": [
+                    {"name": "k_spring", "unit": "J/m**2", "default_value": 2.0, "min_value": 0.1, "max_value": 20.0, "tunable": True},
+                    {"name": "inv_m", "unit": "1/kg", "default_value": 1.0, "min_value": 0.1, "max_value": 10.0, "tunable": False},
+                    {"name": "gamma_visc", "unit": "kg/s", "default_value": 0.6, "min_value": 0.0, "max_value": 10.0, "tunable": True},
+                ],
+                "hamiltonian_expr": "0.5 * k_spring * q_disp**2 + 0.5 * inv_m * p_mom**2",
+                "dissipation_diag_exprs": ["0.0", "gamma_visc", "0.0"],
+                "skew_routing_exprs": {"0,1": "1.0"},
+                "external_drive_exprs": ["0.0", "0.0", "0.0"],
+                "thermal_sink_state_name": "E_therm",
+                "thermal_capacity_scale": 1.0,
+                "spatial_nodes_3d": [
+                    {
+                        "node_id": "mechanical_oscillator_3d",
+                        "position_state_names": ["q_disp"],
+                        "momentum_state_names": ["p_mom"],
+                        "fixed_position_m": [1.8, 0.0, 0.0],
+                        "volume_m3": 1.0e-3,
+                        "radius_m": 0.062,
+                        "associated_state_names": ["q_disp", "p_mom"],
+                    },
+                    {
+                        "node_id": "thermal_reservoir_bath_3d",
+                        "fixed_position_m": [0.0, 0.05, 0.0],
+                        "volume_m3": 5.0e-3,
+                        "radius_m": 0.106,
+                        "associated_state_names": ["E_therm"],
+                    },
+                ],
+            }
+            target_obj = {"q_disp": 0.2}
+        elif any(
+            k in q_lc
+            for k in ("quantum", "qubit", "decoherence", "lindblad", "bloch", "rabi", "dephasing", "coherence")
+        ):
+            spec_dict = {
+                "name": "synthesized_quantum_quadrature_lindblad_system",
+                "domain": domain if domain != "multiphysics" else "quantum_open_systems",
+                "time_unit": "s",
+                "energy_unit": "J",
+                "state_specs": [
+                    {"name": "q_coh", "unit": "1", "default_value": 1.4, "homeostatic_min": -5.0, "homeostatic_max": 5.0},
+                    {"name": "p_coh", "unit": "1", "default_value": 0.6, "homeostatic_min": -5.0, "homeostatic_max": 5.0},
+                ],
+                "param_specs": [
+                    {"name": "h_omega", "unit": "J", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": True},
+                    {"name": "gamma_dephase", "unit": "1/(J*s)", "default_value": 0.5, "min_value": 0.01, "max_value": 5.0, "tunable": True},
+                    {"name": "u_rabi_drive", "unit": "1/s", "default_value": 0.8, "min_value": -5.0, "max_value": 5.0, "tunable": True},
+                ],
+                "hamiltonian_expr": "0.5 * h_omega * (q_coh**2 + p_coh**2)",
+                "dissipation_diag_exprs": ["gamma_dephase", "gamma_dephase"],
+                "skew_routing_exprs": {"0,1": "0.25 * gamma_dephase"},
+                "external_drive_exprs": ["u_rabi_drive", "0.0"],
+                "spatial_nodes_3d": [
+                    {
+                        "node_id": "bloch_cavity_mode_3d",
+                        "position_state_names": ["q_coh", "p_coh"],
+                        "fixed_position_m": [0.0, 0.0, 0.0],
+                        "volume_m3": 1.0e-9,
+                        "radius_m": 6.2e-4,
+                        "associated_state_names": ["q_coh", "p_coh"],
+                    }
+                ],
+            }
+            target_obj = {"q_coh": 0.8}
+        else:
+            # Universal 5-Compartment Causal Blast-Radius & Bystander-Shielded Port-Hamiltonian System
+            spec_dict = {
+                "name": "synthesized_universal_coupled_transport_system",
+                "domain": domain,
+                "time_unit": "s",
+                "energy_unit": "1",
+                "state_specs": [
+                    {"name": "x_primary", "unit": "1", "default_value": 2.4, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "primary_target"},
+                    {"name": "x_local_stress", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "local_stress"},
+                    {"name": "x_energy_reservoir", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "energy_reservoir"},
+                    {"name": "x_co_located_bystander", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "co_located_bystander"},
+                    {"name": "x_downstream_receiver", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "downstream_receiver"},
+                ],
+                "param_specs": [
+                    {"name": "k_chem_1", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": True},
+                    {"name": "k_chem_2", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": True},
+                    {"name": "k_chem_3", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": False},
+                    {"name": "k_chem_4", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": False},
+                    {"name": "k_chem_5", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": False},
+                    {"name": "g_clearance_1", "unit": "1/s", "default_value": 0.8, "min_value": 0.05, "max_value": 10.0, "tunable": True},
+                    {"name": "g_clearance_2", "unit": "1/s", "default_value": 0.7, "min_value": 0.05, "max_value": 10.0, "tunable": True},
+                    {"name": "g_clearance_3", "unit": "1/s", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": False},
+                    {"name": "g_clearance_4", "unit": "1/s", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": False},
+                    {"name": "g_clearance_5", "unit": "1/s", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": False},
+                    {"name": "g_onsager_cpl", "unit": "1/s", "default_value": 0.15, "min_value": 0.0, "max_value": 5.0, "tunable": True},
+                    {"name": "u_basal_1", "unit": "1/s", "default_value": 1.4, "min_value": 0.0, "max_value": 10.0, "tunable": True},
+                    {"name": "u_basal_2", "unit": "1/s", "default_value": 0.75, "min_value": 0.0, "max_value": 10.0, "tunable": False},
+                    {"name": "u_basal_3", "unit": "1/s", "default_value": 0.65, "min_value": 0.0, "max_value": 10.0, "tunable": False},
+                    {"name": "u_basal_4", "unit": "1/s", "default_value": 0.65, "min_value": 0.0, "max_value": 10.0, "tunable": False},
+                    {"name": "u_basal_5", "unit": "1/s", "default_value": 0.65, "min_value": 0.0, "max_value": 10.0, "tunable": False},
+                ],
+                "hamiltonian_expr": (
+                    "0.5 * k_chem_1 * x_primary**2 + 0.5 * k_chem_2 * x_local_stress**2 "
+                    "+ 0.5 * k_chem_3 * x_energy_reservoir**2 + 0.5 * k_chem_4 * x_co_located_bystander**2 "
+                    "+ 0.5 * k_chem_5 * x_downstream_receiver**2"
+                ),
+                "dissipation_diag_exprs": [
+                    "g_clearance_1 * (1.0 + 0.15 * x_local_stress**2)",
+                    "g_clearance_2",
+                    "g_clearance_3",
+                    "g_clearance_4",
+                    "g_clearance_5",
+                ],
+                "dissipation_coupling_exprs": {
+                    "0,1": "g_onsager_cpl",
+                    "0,2": "0.5 * g_onsager_cpl",
+                    "0,3": "0.35 * g_onsager_cpl",
+                    "0,4": "0.25 * g_onsager_cpl",
+                },
+                "skew_routing_exprs": {},
+                "external_drive_exprs": [
+                    "u_basal_1 * (x_energy_reservoir / (0.5 + x_energy_reservoir)) / (1.0 + 0.25 * x_local_stress**2)",
+                    "u_basal_2",
+                    "u_basal_3",
+                    "u_basal_4",
+                    "u_basal_5",
+                ],
+                "spatial_nodes_3d": [
+                    {
+                        "node_id": "primary_compartment_3d",
+                        "fixed_position_m": [0.0, 0.0, 0.0],
+                        "volume_m3": 1.0e-12,
+                        "radius_m": 6.203e-5,
+                        "associated_state_names": ["x_primary"],
+                    },
+                    {
+                        "node_id": "local_stress_compartment_3d",
+                        "fixed_position_m": [1.0e-4, 0.0, 0.0],
+                        "volume_m3": 1.0e-12,
+                        "radius_m": 6.203e-5,
+                        "associated_state_names": ["x_local_stress"],
+                    },
+                    {
+                        "node_id": "energy_reservoir_compartment_3d",
+                        "fixed_position_m": [0.0, 1.0e-4, 0.0],
+                        "volume_m3": 1.5e-12,
+                        "radius_m": 7.101e-5,
+                        "associated_state_names": ["x_energy_reservoir"],
+                    },
+                    {
+                        "node_id": "co_located_bystander_compartment_3d",
+                        "fixed_position_m": [-1.2e-4, 0.0, 0.0],
+                        "volume_m3": 1.0e-12,
+                        "radius_m": 6.203e-5,
+                        "associated_state_names": ["x_co_located_bystander"],
+                    },
+                    {
+                        "node_id": "downstream_receiver_compartment_3d",
+                        "fixed_position_m": [0.0, 0.0, 2.5e-4],
+                        "volume_m3": 2.0e-12,
+                        "radius_m": 7.816e-5,
+                        "associated_state_names": ["x_downstream_receiver"],
+                    },
+                ],
+            }
+            target_obj = {"x_primary": 1.0}
+            if is_anomaly_discovery:
+                anomaly_patch = {
+                    "thermodynamic_mode": "passive_dissipative",
+                    "patch_param": {
+                        "name": "g_nl_anom",
+                        "unit": "1/s",
+                        "default_value": 0.35,
+                        "min_value": 0.0,
+                    },
+                    "patch_expressions": {"0": "g_nl_anom * (x_primary**2)"},
+                }
+
+        result: dict[str, Any] = {
+            "candidate_spec": spec_dict,
+            "target_state_objective": target_obj,
+            "inverse_mode": inv_mode,
+            "unmodeled_anomaly_patch": anomaly_patch,
+            "synthesis_rationale": (
+                f"Synthesized dimensionally homogeneous Port-Hamiltonian world model "
+                f"'{spec_dict['name']}' (mode={inv_mode}) for open-ended hypothesis: {question[:140]}"
+            ),
+        }
+        return json.dumps(result), result
 
     @staticmethod
     def _handle_symbolic_repair(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -439,6 +929,40 @@ class MathematicalEpistemicPolicy:
                     state_unit_map=state_unit_map,
                     param_by_name=param_by_name,
                 )
+
+            d_cpl = spec_dict.get("dissipation_coupling_exprs", {})
+            if isinstance(d_cpl, dict):
+                for pair_k, cpl_expr in d_cpl.items():
+                    if isinstance(pair_k, str) and "," in pair_k:
+                        parts = pair_k.strip("()[] ").split(",")
+                        i_idx, j_idx = int(parts[0]), int(parts[1])
+                        if 0 <= i_idx < len(state_specs) and 0 <= j_idx < len(state_specs):
+                            u_i = state_unit_map[state_specs[i_idx]["name"]]
+                            u_j = state_unit_map[state_specs[j_idx]["name"]]
+                            req_rcpl_unit = (u_i * u_j) / (energy_u * time_u)
+                            _solve_expression_dimensional_constraints(
+                                str(cpl_expr),
+                                target_unit=req_rcpl_unit,
+                                state_unit_map=state_unit_map,
+                                param_by_name=param_by_name,
+                            )
+
+            s_cpl = spec_dict.get("skew_routing_exprs") or spec_dict.get("skew_coupling_exprs") or {}
+            if isinstance(s_cpl, dict):
+                for pair_k, skew_expr in s_cpl.items():
+                    if isinstance(pair_k, str) and "," in pair_k:
+                        parts = pair_k.strip("()[] ").split(",")
+                        i_idx, j_idx = int(parts[0]), int(parts[1])
+                        if 0 <= i_idx < len(state_specs) and 0 <= j_idx < len(state_specs):
+                            u_i = state_unit_map[state_specs[i_idx]["name"]]
+                            u_j = state_unit_map[state_specs[j_idx]["name"]]
+                            req_j_unit = (u_i * u_j) / (energy_u * time_u)
+                            _solve_expression_dimensional_constraints(
+                                str(skew_expr),
+                                target_unit=req_j_unit,
+                                state_unit_map=state_unit_map,
+                                param_by_name=param_by_name,
+                            )
 
             spec_dict["param_specs"] = list(param_by_name.values())
 
@@ -738,16 +1262,29 @@ class MultiProviderMetaClient:
         self,
         env_overrides: dict[str, str] | None = None,
         http_transport: httpx.BaseTransport | None = None,
-        timeout_seconds: float = 45.0,
+        timeout_seconds: float = 120.0,
     ) -> None:
         load_dotenv()
         env = dict(os.environ)
+        if (
+            env_overrides is None
+            and http_transport is None
+            and "PYTEST_CURRENT_TEST" in os.environ
+            and os.environ.get("CORTIVRA_LIVE_PYTEST") != "1"
+        ):
+            for k in ("FIREWORKS_API_KEY", "BASETEN_API_KEY", "META_API_KEY", "LOCAL_LLM_BASE_URL"):
+                env[k] = ""
         if env_overrides:
             env.update(env_overrides)
 
         self._http_transport = http_transport
         self._timeout = timeout_seconds
         self.telemetry_log: list[LLMInferenceResponse] = []
+
+        baseten_default_model = env.get(
+            "BASETEN_MODEL",
+            env.get("BASETEN_MODEL_SPARK_OPEN", "meta-models/muse-spark-open-1026"),
+        )
 
         self.providers: dict[ProviderName, ProviderEndpointConfig] = {
             "fireworks": ProviderEndpointConfig(
@@ -778,12 +1315,12 @@ class MultiProviderMetaClient:
                 provider="baseten",
                 api_key=env.get("BASETEN_API_KEY", ""),
                 base_url=env.get("BASETEN_BASE_URL", "https://inference.baseten.co/v1").rstrip("/"),
-                default_model=env.get("BASETEN_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+                default_model=baseten_default_model,
                 role_models={
-                    "muse_wonder": env.get("BASETEN_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
-                    "muse_spark": env.get("BASETEN_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
-                    "muse_spark_open": env.get("BASETEN_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
-                    "muse_glimmer": env.get("BASETEN_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+                    "muse_wonder": env.get("BASETEN_MODEL_WONDER", baseten_default_model),
+                    "muse_spark": env.get("BASETEN_MODEL_SPARK", baseten_default_model),
+                    "muse_spark_open": env.get("BASETEN_MODEL_SPARK_OPEN", baseten_default_model),
+                    "muse_glimmer": env.get("BASETEN_MODEL_GLIMMER", baseten_default_model),
                 },
             ),
             "meta": ProviderEndpointConfig(
@@ -867,7 +1404,11 @@ class MultiProviderMetaClient:
                     data = resp.json()
 
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                content = str(data["choices"][0]["message"]["content"])
+                msg_obj = data["choices"][0]["message"]
+                raw_c = msg_obj.get("content")
+                if not raw_c:
+                    raw_c = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or ""
+                content = str(raw_c)
                 usage = data.get("usage", {})
                 p_tok = int(usage.get("prompt_tokens", 0))
                 c_tok = int(usage.get("completion_tokens", 0))

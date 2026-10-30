@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
+import re
 from typing import Any, Sequence
 
 import torch
@@ -24,6 +25,7 @@ from cortivra.layer4_engine.rollout_arena import EquilibriumLandscapeReport
 from cortivra.layer5_discovery.latent_discovery import NonMarkovianMemoryReport
 from cortivra.layer5_discovery.sparse_regression import InvariantDiscoveryReport
 from cortivra.layer6_agents.falsification_and_design import verify_multi_horizon_stability
+from cortivra.observability.flight_recorder import suppress_inner_trace
 
 
 @dataclass(frozen=True)
@@ -290,7 +292,8 @@ def search_vault_isomorphisms(
             seen.add(pp.name)
     variables.append(("t_char", brick.time_unit))
 
-    pi_groups = discover_dimensionless_groups(variables)  # type: ignore[arg-type]
+    with suppress_inner_trace():
+        pi_groups = discover_dimensionless_groups(variables)  # type: ignore[arg-type]
     target_pi_count = len(pi_groups)
     brick_feats = _extract_brick_operator_features(brick)
 
@@ -600,7 +603,23 @@ def build_differential_epistemic_briefing(
             seen_v.add(pp.name)
     variables.append(("t_char", brick.time_unit))
     pi_groups = discover_dimensionless_groups(variables)  # type: ignore[arg-type]
-    pi_strs = tuple(g.format_expression() for g in pi_groups)
+    pi_list = [g.format_expression() for g in pi_groups]
+    p_map_now = {brick.param_specs[j].name: float(p_row[j].item()) for j in range(brick.param_dim)}
+    stiff_keys = [k for k in p_map_now if re.match(r"^k(?:_|\d)", k)]
+    clear_keys = [k for k in p_map_now if re.match(r"^(?:g(?:_|\d)|gamma)", k) and "cpl" not in k]
+    if stiff_keys and clear_keys:
+        k0_n, g0_n = stiff_keys[0], clear_keys[0]
+        k0_v = max(abs(p_map_now[k0_n]), 1e-6)
+        g0_v = max(abs(p_map_now[g0_n]), 1e-6)
+        da_0 = k0_v / g0_v
+        zeta_0 = g0_v / (2.0 * math.sqrt(k0_v))
+        pi_list.insert(0, f"Pi_Damkohler_0 = {k0_n} / {g0_n} = {da_0:.4f}")
+        pi_list.insert(1, f"Pi_DampingRatio_0 = {g0_n} / (2*sqrt({k0_n})) = {zeta_0:.4f}")
+        cpl_keys = [k for k in p_map_now if "cpl" in k]
+        if cpl_keys:
+            bi_0 = abs(p_map_now[cpl_keys[0]]) / g0_v
+            pi_list.insert(2, f"Pi_BiotLeakage_0 = {cpl_keys[0]} / {g0_n} = {bi_0:.4f}")
+    pi_strs = tuple(pi_list)
 
     inv_strs: tuple[str, ...] = ()
     if invariant_report is not None:

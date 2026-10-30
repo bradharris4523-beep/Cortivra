@@ -436,6 +436,40 @@ def surrogate_event_impulse(
     return sharpness_beta * sig * (1.0 - sig)
 
 
+def euclidean_distance_3d(
+    dx: torch.Tensor,
+    dy: torch.Tensor | float = 0.0,
+    dz: torch.Tensor | float = 0.0,
+    softening_eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Singularity-regularized 3D SE(3) Euclidean distance:
+        r = sqrt(dx^2 + dy^2 + dz^2 + eps^2)
+    Smooth everywhere (including zero separation) and invariant under 3D translations and rotations.
+    """
+    dy_t = torch.as_tensor(dy, dtype=dx.dtype, device=dx.device)
+    dz_t = torch.as_tensor(dz, dtype=dx.dtype, device=dx.device)
+    r_sq = (dx ** 2) + (dy_t ** 2) + (dz_t ** 2) + (softening_eps ** 2)
+    return torch.sqrt(r_sq)
+
+
+def inverse_distance_power_3d(
+    dx: torch.Tensor,
+    dy: torch.Tensor | float = 0.0,
+    dz: torch.Tensor | float = 0.0,
+    power_p: float = 1.0,
+    softening_eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Singularity-regularized 3D inverse-distance power kernel:
+        K_p(dx, dy, dz) = (dx^2 + dy^2 + dz^2 + eps^2)^(-p / 2)
+    Covers gravitational/Coulomb potentials (p=1), inverse-square fields (p=2),
+    dipole/central-force kernels (p=3), and van der Waals / Lennard-Jones interactions (p=6, 12).
+    """
+    r = euclidean_distance_3d(dx, dy, dz, softening_eps=softening_eps)
+    return torch.pow(r, -float(power_p))
+
+
 # ---------------------------------------------------------------------------
 # Formal Primitive Registry for Symbolic Compilation & Discovery (Layers 3-4)
 # ---------------------------------------------------------------------------

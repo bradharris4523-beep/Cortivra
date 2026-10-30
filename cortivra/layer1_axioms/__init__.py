@@ -9,6 +9,7 @@ from cortivra.layer1_axioms.hamiltonian import (
     ParamSpec,
     PortConnection,
     PowerPortSpec,
+    SpatialNode3DSpec,
     StateVarSpec,
 )
 from cortivra.layer1_axioms.shields import (
@@ -25,6 +26,7 @@ from cortivra.layer1_axioms.shields import (
     verify_equation_dimensions,
     verify_homeostatic_viability,
     verify_mass_conservation,
+    verify_quantum_unitary_norm_conservation,
     verify_reaction_electroneutrality,
     verify_thermodynamic_laws,
 )
@@ -186,6 +188,7 @@ __all__ = [
     "StateVarSpec",
     "ParamSpec",
     "PowerPortSpec",
+    "SpatialNode3DSpec",
     "PortConnection",
     "LawBrick",
     "CanonicalHamiltonianBrick",
@@ -201,6 +204,7 @@ __all__ = [
     "verify_reaction_electroneutrality",
     "verify_thermodynamic_laws",
     "verify_detailed_balance_cycle",
+    "verify_quantum_unitary_norm_conservation",
     "compute_viable_universe_mask",
     "verify_homeostatic_viability",
     "analyze_unexplained_residual",

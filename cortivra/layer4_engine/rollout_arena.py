@@ -14,6 +14,7 @@ from cortivra.layer1_axioms.shields import compute_viable_universe_mask
 from cortivra.observability.flight_recorder import (
     OperatorSpectrumSummary,
     emit_trace_node,
+    record_simulation_activity,
     summarize_singular_spectrum,
     suppress_inner_trace,
 )
@@ -114,14 +115,131 @@ def select_optimal_integrator(
             return "symplectic_midpoint"
 
         f0 = brick.flow(s0, p0)
-        eps = 1e-4
-        s_pert = brick.clamp_to_hard_bounds(s0 + eps)
-        f1 = brick.flow(s_pert, p0)
-        local_lip = float(torch.linalg.norm(f1 - f0).item()) / max(eps, 1e-12)
+        f_probe = brick.flow(s_probe, p0)
+        eps = 1e-5
+        local_lip = 0.0
+        for d_i in range(brick.state_dim):
+            for base_s, base_f in ((s0, f0), (s_probe, f_probe)):
+                s_pert = base_s.clone()
+                s_pert[:, d_i] = s_pert[:, d_i] + eps
+                s_pert = brick.clamp_to_hard_bounds(s_pert)
+                f1 = brick.flow(s_pert, p0)
+                col_lip = float(torch.linalg.norm(f1 - base_f).item()) / max(eps, 1e-12)
+                if col_lip > local_lip:
+                    local_lip = col_lip
+        if local_lip * dt > 8.0:
+            return "rosenbrock2"
         if local_lip * dt > 0.4:
             return "adaptive_rk"
 
     return "rk4"
+
+
+def _compute_flow_jacobian_batched(
+    brick: LawBrick,
+    state: torch.Tensor,
+    params: torch.Tensor,
+    port_inputs: dict[str, torch.Tensor] | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Compute the batched state Jacobian `J_F(x) = dF/dx` of shape `[Batch, StateDim, StateDim]`
+    via centered finite differences (preserving outer autograd graph wrt `state` and `params`).
+    """
+    batch, state_dim = state.shape
+    cols: list[torch.Tensor] = []
+    for j in range(state_dim):
+        e_j = torch.zeros_like(state)
+        e_j[:, j] = eps
+        f_plus = brick.flow(state + e_j, params, port_inputs=port_inputs)
+        f_minus = brick.flow(state - e_j, params, port_inputs=port_inputs)
+        cols.append((f_plus - f_minus) / (2.0 * eps))
+    return torch.stack(cols, dim=-1)
+
+
+def _step_rosenbrock2(
+    brick: LawBrick,
+    state: torch.Tensor,
+    params: torch.Tensor,
+    dt: float,
+    port_inputs: dict[str, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """
+    2-stage, 2nd-order L-stable Rosenbrock-Wanner (`ROS2`) stiff multi-timescale integrator:
+        gamma = 1 - 1 / sqrt(2)
+        (I - gamma * dt * J_F(x_n)) k_1 = F(x_n)
+        (I - gamma * dt * J_F(x_n)) k_2 = F(x_n + 0.5 * dt * k_1) - gamma * dt * J_F(x_n) k_1
+        x_{n+1} = x_n + dt * k_2
+    Unconditionally L-stable (`R(infinity) = 0`) for arbitrarily stiff decaying modes (`Re(lambda)*dt -> -inf`)
+    and 100% differentiable via `torch.linalg.solve` without nonlinear Newton iteration loops.
+    """
+    gamma = 1.0 - 0.7071067811865475  # 1 - 1/sqrt(2)
+    batch, state_dim = state.shape
+    f0 = brick.flow(state, params, port_inputs=port_inputs)
+    j_mat = _compute_flow_jacobian_batched(brick, state, params, port_inputs=port_inputs)
+    eye = torch.eye(state_dim, dtype=state.dtype, device=state.device).unsqueeze(0).expand(batch, -1, -1)
+    w_mat = eye - (gamma * dt) * j_mat
+
+    try:
+        k1 = torch.linalg.solve(w_mat, f0.unsqueeze(-1)).squeeze(-1)
+    except RuntimeError:
+        w_reg = w_mat + 1e-8 * eye
+        k1 = torch.linalg.lstsq(w_reg, f0.unsqueeze(-1)).solution.squeeze(-1)
+
+    x_mid = brick.clamp_to_hard_bounds(state + 0.5 * dt * k1)
+    f_mid = brick.flow(x_mid, params, port_inputs=port_inputs)
+    jk1 = torch.bmm(j_mat, k1.unsqueeze(-1)).squeeze(-1)
+    rhs2 = f_mid - (gamma * dt) * jk1
+
+    try:
+        k2 = torch.linalg.solve(w_mat, rhs2.unsqueeze(-1)).squeeze(-1)
+    except RuntimeError:
+        w_reg = w_mat + 1e-8 * eye
+        k2 = torch.linalg.lstsq(w_reg, rhs2.unsqueeze(-1)).solution.squeeze(-1)
+
+    return brick.clamp_to_hard_bounds(state + dt * k2)
+
+
+def _step_implicit_midpoint(
+    brick: LawBrick,
+    state: torch.Tensor,
+    params: torch.Tensor,
+    dt: float,
+    port_inputs: dict[str, torch.Tensor] | None = None,
+    max_newton_iters: int = 8,
+    tol: float = 1e-9,
+) -> torch.Tensor:
+    """
+    A-stable, symmetric, symplectic 2nd-order Implicit Midpoint integrator:
+        x_{n+1} = x_n + dt * F(0.5 * (x_n + x_{n+1}))
+    Solved via damped Newton-Raphson with exact Jacobian factorization `(I - 0.5 * dt * J_F)`.
+    """
+    batch, state_dim = state.shape
+    f0 = brick.flow(state, params, port_inputs=port_inputs)
+    j_mat = _compute_flow_jacobian_batched(brick, state, params, port_inputs=port_inputs)
+    eye = torch.eye(state_dim, dtype=state.dtype, device=state.device).unsqueeze(0).expand(batch, -1, -1)
+    w_mat = eye - (0.5 * dt) * j_mat
+
+    try:
+        dx_init = torch.linalg.solve(w_mat, (dt * f0).unsqueeze(-1)).squeeze(-1)
+    except RuntimeError:
+        dx_init = dt * f0
+    x_next = brick.clamp_to_hard_bounds(state + dx_init)
+
+    for _ in range(max_newton_iters):
+        x_mid = 0.5 * (state + x_next)
+        f_mid = brick.flow(x_mid, params, port_inputs=port_inputs)
+        res = x_next - state - dt * f_mid
+        max_r = float(torch.max(torch.abs(res)).detach().item())
+        if max_r <= tol:
+            break
+        try:
+            delta = torch.linalg.solve(w_mat, (-res).unsqueeze(-1)).squeeze(-1)
+        except RuntimeError:
+            delta = -res
+        x_next = brick.clamp_to_hard_bounds(x_next + delta)
+
+    return x_next
 
 
 def _step_adaptive_rk4(
@@ -137,6 +255,7 @@ def _step_adaptive_rk4(
     Dyadic error-controlled 4th-order Runge-Kutta with 5th-order Richardson extrapolation.
     Doubles the substep count `n_sub = 1, 2, 4, ..., max_substeps` until the maximum local
     Richardson truncation error across the interval `dt` is `<= adaptive_tol`.
+    Automatically falls back to `_step_rosenbrock2` if explicit substeps encounter stiffness.
     """
     n_sub = 1
     limit = max(int(max_substeps), 1)
@@ -146,17 +265,31 @@ def _step_adaptive_rk4(
         sub_dt = dt / float(n_sub)
         curr = state
         max_err = 0.0
+        stiff_overflow = False
         for _ in range(n_sub):
             x_full = brick.step_rk4(curr, params, dt=sub_dt, port_inputs=port_inputs)
             x_h1 = brick.step_rk4(curr, params, dt=0.5 * sub_dt, port_inputs=port_inputs)
             x_h2 = brick.step_rk4(x_h1, params, dt=0.5 * sub_dt, port_inputs=port_inputs)
+            if not (bool(torch.isfinite(x_full).all().item()) and bool(torch.isfinite(x_h2).all().item())):
+                stiff_overflow = True
+                break
             step_err = float(torch.max(torch.abs(x_h2 - x_full)).detach().item()) / 15.0
             if step_err > max_err:
                 max_err = step_err
             curr = brick.clamp_to_hard_bounds(x_h2 + (x_h2 - x_full) / 15.0)
 
+        if stiff_overflow:
+            if n_sub >= limit:
+                return _step_rosenbrock2(brick, state, params, dt=dt, port_inputs=port_inputs)
+            n_sub = min(n_sub * 2, limit)
+            continue
+
         best_extrap = curr
-        if max_err <= adaptive_tol or n_sub >= limit:
+        if max_err <= adaptive_tol:
+            break
+        if n_sub >= limit:
+            if max_err > 100.0 * adaptive_tol:
+                return _step_rosenbrock2(brick, state, params, dt=dt, port_inputs=port_inputs)
             break
         n_sub = min(n_sub * 2, limit)
 
@@ -200,7 +333,16 @@ def rollout_trajectories(
         raise ValueError(f"num_steps must be >= 1, got {num_steps}.")
     if dt <= 0.0:
         raise ValueError(f"dt must be positive for forward rollout, got {dt} (use retrodict_trajectory for backward).")
-    valid_integrators = ("auto", "rk4", "adaptive_rk", "symplectic_midpoint", "exponential_euler", "euler")
+    valid_integrators = (
+        "auto",
+        "rk4",
+        "adaptive_rk",
+        "rosenbrock2",
+        "implicit_midpoint",
+        "symplectic_midpoint",
+        "exponential_euler",
+        "euler",
+    )
     if integrator not in valid_integrators:
         raise ValueError(f"Unsupported integrator '{integrator}'. Expected one of {valid_integrators}.")
 
@@ -224,9 +366,16 @@ def rollout_trajectories(
     for step_idx in range(num_steps):
         p_step = _slice_port_inputs(port_inputs, step_idx, num_steps)
         if resolved_integrator == "rk4":
-            x = brick.step_rk4(x, params, dt=dt, port_inputs=p_step)
+            x_next = brick.step_rk4(x, params, dt=dt, port_inputs=p_step)
+            if integrator == "auto" and not bool(torch.isfinite(x_next).all().item()):
+                x_next = _step_adaptive_rk4(brick, x, params, dt=dt, port_inputs=p_step, adaptive_tol=adaptive_tol)
+            x = x_next
         elif resolved_integrator == "adaptive_rk":
             x = _step_adaptive_rk4(brick, x, params, dt=dt, port_inputs=p_step, adaptive_tol=adaptive_tol)
+        elif resolved_integrator == "rosenbrock2":
+            x = _step_rosenbrock2(brick, x, params, dt=dt, port_inputs=p_step)
+        elif resolved_integrator == "implicit_midpoint":
+            x = _step_implicit_midpoint(brick, x, params, dt=dt, port_inputs=p_step)
         elif resolved_integrator == "symplectic_midpoint":
             x = brick.step_symplectic_midpoint(x, params, dt=dt, port_inputs=p_step)
         elif resolved_integrator == "exponential_euler":
@@ -256,6 +405,13 @@ def rollout_trajectories(
         flows_t = torch.zeros_like(states_t)
         energies_t = torch.zeros((states_t.shape[0], states_t.shape[1]), dtype=states_t.dtype, device=states_t.device)
 
+    batch_cnt = int(states_t.shape[0])
+    record_simulation_activity(
+        ode_rollout_calls=1,
+        trajectories_integrated=batch_cnt,
+        integration_steps_executed=batch_cnt * int(num_steps),
+        integrator=resolved_integrator,
+    )
     return RolloutResult(
         states=states_t,
         flows=flows_t,
@@ -318,6 +474,13 @@ def retrodict_trajectory(
     step_viable_t = torch.stack([compute_viable_universe_mask(brick, s) for s in chron_states], dim=1)
     all_viable_t = step_viable_t.all(dim=1)
 
+    batch_retro = int(states_t.shape[0])
+    record_simulation_activity(
+        ode_rollout_calls=1,
+        trajectories_integrated=batch_retro,
+        integration_steps_executed=batch_retro * int(num_steps),
+        integrator=f"retrodict_{mode}",
+    )
     res_obj = RolloutResult(
         states=states_t,
         flows=flows_t,
@@ -439,6 +602,7 @@ def find_steady_state_and_stability(
         lam_vec = lam_flat.unsqueeze(-1).unsqueeze(-1)
 
     f_final, jac_final = _compute_batch_state_jacobian(brick, x, p, port_inputs=port_inputs)
+    record_simulation_activity(newton_jacobian_solves=batch_size)
     res_norms = torch.linalg.norm(f_final, dim=-1)
     converged = res_norms <= max(tol * 10.0, 1e-5)
 
@@ -562,6 +726,7 @@ def discover_equilibrium_landscape(
     probes = default_x.expand(n_probes, -1).clone()
 
     if n_probes > 1 and state_dim > 0:
+        record_simulation_activity(sobol_qmc_universes_sampled=n_probes)
         sobol = torch.quasirandom.SobolEngine(dimension=state_dim, scramble=True, seed=seed)
         u = sobol.draw(n_probes).to(dtype=torch.float64, device=device)
         for s_i, sp in enumerate(brick.state_specs):
@@ -761,11 +926,95 @@ def scan_parameter_bifurcation(
     )
 
 
-def estimate_trajectory_derivatives(states: torch.Tensor, dt: float) -> torch.Tensor:
+def estimate_trajectory_noise_std(states: torch.Tensor) -> float:
+    """
+    Estimate additive measurement noise standard deviation `sigma_noise` on a trajectory
+    `states` (`[T, D]` or `[B, T, D]`) using the 4th-order finite-difference annihilator
+    `Delta^4 x_k = x_{k+2} - 4 x_{k+1} + 6 x_k - 4 x_{k-1} + x_{k-2}`, which annihilates
+    smooth cubic polynomials while scaling additive white noise by `sqrt(70) * sigma_noise`.
+    """
+    s = states.detach().to(torch.float64)
+    if s.ndim == 2:
+        s = s.unsqueeze(0)
+    if s.shape[1] < 6:
+        return 0.0
+    d4 = s[:, 4:, :] - 4.0 * s[:, 3:-1, :] + 6.0 * s[:, 2:-2, :] - 4.0 * s[:, 1:-3, :] + s[:, :-4, :]
+    # Median Absolute Deviation (MAD) estimator: sigma = median(|d4|) / (0.67449 * sqrt(70))
+    mad = float(torch.median(torch.abs(d4)).item())
+    return mad / (0.67448975 * (70.0**0.5))
+
+
+def savitzky_golay_denoise_and_differentiate(
+    states: torch.Tensor,
+    dt: float,
+    window_length: int | None = None,
+    poly_order: int = 3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Denoise `states` (`[T, D]` or `[B, T, D]`) and compute regularized analytical first derivatives
+    `dx/dt` using exact local polynomial Savitzky-Golay least-squares projection across both
+    interior and asymmetric boundary windows (eliminating boundary padding artifacts).
+    """
+    if dt <= 0.0:
+        raise ValueError(f"dt must be positive, got {dt}.")
+    squeeze_batch = False
+    s = states.to(torch.float64)
+    if s.ndim == 2:
+        s = s.unsqueeze(0)
+        squeeze_batch = True
+    if s.ndim != 3:
+        raise ValueError(f"Expected 2D or 3D states tensor, got shape {tuple(states.shape)}.")
+
+    batch, t_len, state_dim = s.shape
+    if window_length is None:
+        target_w = max(9, min(19, int(round(0.35 / max(dt, 1e-3)))))
+        if target_w % 2 == 0:
+            target_w += 1
+        w = min(target_w, t_len)
+    else:
+        w = min(int(window_length), t_len)
+    if w % 2 == 0:
+        w = max(w - 1, 1)
+    p_ord = min(int(poly_order), w - 1)
+    if w < 5 or p_ord < 1:
+        dx = estimate_trajectory_derivatives(states, dt=dt, denoise=False)
+        return states, dx
+
+    half_w = w // 2
+    s_smooth = torch.zeros_like(s)
+    dx_smooth = torch.zeros_like(s)
+    exponents = torch.arange(p_ord + 1, dtype=torch.float64, device=s.device).unsqueeze(0)  # [1, p+1]
+
+    for t_idx in range(t_len):
+        start = max(0, min(t_idx - half_w, t_len - w))
+        end = start + w
+        # Local time offsets tau = (k - t_idx) * dt around evaluation index t_idx
+        tau = (torch.arange(start, end, dtype=torch.float64, device=s.device) - float(t_idx)) * dt  # [w]
+        v_mat = tau.unsqueeze(-1) ** exponents  # [w, p+1]
+        # Solve least-squares polynomial coefficients c = pinv(V) @ y_win
+        pinv_v = torch.linalg.pinv(v_mat)  # [p+1, w]
+        w_val = pinv_v[0, :]  # row 0 evaluates c_0 = x_hat(t_idx)
+        w_der = pinv_v[1, :]  # row 1 evaluates c_1 = dx_hat/dt(t_idx)
+        y_win = s[:, start:end, :]  # [B, w, D]
+        s_smooth[:, t_idx, :] = torch.einsum("w,bwd->bd", w_val, y_win)
+        dx_smooth[:, t_idx, :] = torch.einsum("w,bwd->bd", w_der, y_win)
+
+    if squeeze_batch:
+        return s_smooth.squeeze(0), dx_smooth.squeeze(0)
+    return s_smooth, dx_smooth
+
+
+def estimate_trajectory_derivatives(
+    states: torch.Tensor,
+    dt: float,
+    denoise: bool | str = "auto",
+) -> torch.Tensor:
     """
     Estimate instantaneous velocities `dx/dt` from a state trajectory tensor of shape
     `[Batch, NumSteps, StateDim]` or `[NumSteps, StateDim]` using 4th-order central finite
     differences in the interior (`O(dt^4)`) and 2nd-order stencils at the boundaries.
+    When `denoise="auto"` (or `denoise=True`), automatically switches to local polynomial
+    Savitzky-Golay derivative projection when high-frequency sensor noise is detected.
     """
     if dt <= 0.0:
         raise ValueError(f"dt must be positive, got {dt}.")
@@ -779,6 +1028,16 @@ def estimate_trajectory_derivatives(states: torch.Tensor, dt: float) -> torch.Te
     t_len = states.shape[1]
     if t_len < 2:
         raise ValueError("Need at least 2 time points to estimate derivatives.")
+
+    if denoise is True and t_len >= 7:
+        _, dx_sg = savitzky_golay_denoise_and_differentiate(states, dt=dt)
+        return dx_sg.squeeze(0) if squeeze_batch else dx_sg
+    elif denoise == "auto" and t_len >= 9:
+        noise_std = estimate_trajectory_noise_std(states)
+        sig_std = max(float(torch.std(states.detach().to(torch.float64)).item()), 1e-12)
+        if noise_std > 0.008 * sig_std and noise_std > 25.0 * (dt**3) * sig_std:
+            _, dx_sg = savitzky_golay_denoise_and_differentiate(states, dt=dt)
+            return dx_sg.squeeze(0) if squeeze_batch else dx_sg
 
     dx_dt = torch.zeros_like(states)
     if t_len == 2:
@@ -802,3 +1061,283 @@ def estimate_trajectory_derivatives(states: torch.Tensor, dt: float) -> torch.Te
         dx_dt[:, -1] = (3.0 * states[:, -1] - 4.0 * states[:, -2] + states[:, -3]) / (2.0 * dt)
 
     return dx_dt.squeeze(0) if squeeze_batch else dx_dt
+
+
+@dataclass(frozen=True)
+class StochasticLangevinRolloutResult:
+    """
+    Fluctuation-Dissipation Theorem (FDT) Stochastic Port-Hamiltonian Langevin ensemble result.
+    """
+
+    ensemble_states: torch.Tensor
+    mean_trajectory: torch.Tensor
+    std_trajectory: torch.Tensor
+    ensemble_energies: torch.Tensor
+    viable_fraction: float
+    thermal_energy_scale: float
+    max_conservative_noise_leakage: float
+
+
+@dataclass(frozen=True)
+class KramersBarrierReport:
+    """
+    Free-energy barrier `Delta_H^dagger` and Eyring-Kramers transition rate report between
+    metastable attractors and saddle points.
+    """
+
+    num_wells: int
+    num_saddles: int
+    well_states: torch.Tensor
+    saddle_states: torch.Tensor
+    well_energies: torch.Tensor
+    saddle_energies: torch.Tensor
+    energy_barrier_delta_h: float
+    eyring_kramers_escape_rate: float
+    mean_first_passage_time: float
+
+
+def _symmetric_psd_matrix_sqrt(r_mat: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the exact spectral matrix square root `Sigma = V * diag(sqrt(max(lambda_i, 0))) * V^T`
+    of a batch of symmetric positive semi-definite Onsager dissipation matrices `R(x)` (`[B, D, D]`).
+    """
+    r_sym = 0.5 * (r_mat + r_mat.transpose(-1, -2))
+    eigvals, eigvecs = torch.linalg.eigh(r_sym)
+    sqrt_eigs = torch.sqrt(torch.clamp(eigvals, min=0.0))
+    return torch.bmm(eigvecs * sqrt_eigs.unsqueeze(-2), eigvecs.transpose(-1, -2))
+
+
+def rollout_stochastic_langevin_ensemble(
+    brick: LawBrick,
+    initial_state: torch.Tensor,
+    params: torch.Tensor,
+    dt: float,
+    num_steps: int,
+    thermal_energy_scale: float = 0.02,
+    num_trajectories: int = 16,
+    seed: int = 42,
+) -> StochasticLangevinRolloutResult:
+    """
+    Integrate the Fluctuation-Dissipation Stochastic Port-Hamiltonian Langevin equation:
+        `dx = [(J(x) - R(x)) * grad_H(x) + u(x)] dt + sqrt(2 * eps_th * R(x)) dW_t`
+    across `num_trajectories` parallel realizations.
+
+    Because the noise covariance `2 * eps_th * R(x)` is constructed from the exact spectral
+    square root of the Onsager dissipation matrix `R(x) >= 0`:
+        1. Purely conservative coordinates (where `R_{ii} = 0`) receive identically zero
+           spurious thermal noise (`max_conservative_noise_leakage == 0`).
+        2. Any linear conservation law `m^T R(x) = 0` is preserved pathwise by the stochastic noise.
+    """
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be >= 1, got {num_steps}.")
+    if dt <= 0.0:
+        raise ValueError(f"dt must be positive, got {dt}.")
+    if num_trajectories < 1:
+        raise ValueError(f"num_trajectories must be >= 1, got {num_trajectories}.")
+
+    x0 = initial_state.detach().to(torch.float64)
+    if x0.ndim == 1:
+        x0 = x0.unsqueeze(0)
+    x = brick.clamp_to_hard_bounds(x0[:1].expand(num_trajectories, -1).clone())
+
+    p0 = params.detach().to(torch.float64)
+    if p0.ndim == 1:
+        p0 = p0.unsqueeze(0)
+    p = p0[:1].expand(num_trajectories, -1).clone()
+
+    eps_th = max(float(thermal_energy_scale), 0.0)
+    gen = torch.Generator(device=x.device)
+    gen.manual_seed(int(seed))
+
+    states_hist: list[torch.Tensor] = [x]
+    energies_hist: list[torch.Tensor] = [brick.hamiltonian_energy(x, p)]
+    viable_hist: list[torch.Tensor] = [compute_viable_universe_mask(brick, x)]
+    max_cons_leak = 0.0
+
+    for _ in range(num_steps):
+        with torch.no_grad():
+            x_det = brick.step_rk4(x, p, dt=dt)
+            if eps_th > 0.0 and not getattr(brick, "is_matrix_free", False):
+                r_mat = brick.dissipation_matrix(x, p)
+                sigma = _symmetric_psd_matrix_sqrt(r_mat)
+                dw = torch.randn(x.shape, dtype=torch.float64, device=x.device, generator=gen) * (
+                    (2.0 * eps_th * dt) ** 0.5
+                )
+                noise_step = torch.bmm(sigma, dw.unsqueeze(-1)).squeeze(-1)
+                diag_r = torch.diagonal(r_mat, dim1=-2, dim2=-1)
+                cons_mask = diag_r <= 1e-14
+                if bool(cons_mask.any().item()):
+                    leak = float(torch.max(torch.abs(noise_step[cons_mask])).item())
+                    max_cons_leak = max(max_cons_leak, leak)
+                x = brick.clamp_to_hard_bounds(x_det + noise_step)
+            else:
+                x = x_det
+
+            states_hist.append(x)
+            energies_hist.append(brick.hamiltonian_energy(x, p))
+            viable_hist.append(compute_viable_universe_mask(brick, x))
+
+    ens_states = torch.stack(states_hist, dim=1)  # [N_traj, T+1, D]
+    ens_energies = torch.stack(energies_hist, dim=1)  # [N_traj, T+1]
+    step_viable = torch.stack(viable_hist, dim=1)
+    all_viable = step_viable.all(dim=1)
+    viable_frac = float(all_viable.to(torch.float64).mean().item())
+
+    mean_traj = torch.mean(ens_states, dim=0)
+    std_traj = torch.std(ens_states, dim=0, unbiased=False)
+    record_simulation_activity(
+        ode_rollout_calls=1,
+        trajectories_integrated=int(num_trajectories),
+        integration_steps_executed=int(num_trajectories) * int(num_steps),
+        stochastic_langevin_trajectories=int(num_trajectories),
+        integrator="stochastic_langevin_rk4",
+    )
+
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="rollout_stochastic_langevin_ensemble",
+        target_name=brick.name,
+        global_r2=viable_frac,
+        selected_expression=(
+            f"trajectories={num_trajectories}, eps_th={eps_th:.4f}, "
+            f"viable={viable_frac:.3f}, cons_leak={max_cons_leak:.2e}"
+        ),
+        metrics={
+            "num_trajectories": num_trajectories,
+            "thermal_energy_scale": eps_th,
+            "viable_fraction": round(viable_frac, 4),
+            "max_conservative_noise_leakage": max_cons_leak,
+        },
+        skip_if_inner_loop=True,
+    )
+
+    return StochasticLangevinRolloutResult(
+        ensemble_states=ens_states,
+        mean_trajectory=mean_traj,
+        std_trajectory=std_traj,
+        ensemble_energies=ens_energies,
+        viable_fraction=viable_frac,
+        thermal_energy_scale=eps_th,
+        max_conservative_noise_leakage=max_cons_leak,
+    )
+
+
+def compute_kramers_barrier_and_escape_rate(
+    brick: LawBrick,
+    params: torch.Tensor,
+    landscape_report: EquilibriumLandscapeReport | None = None,
+    thermal_energy_scale: float = 0.1,
+    num_probes: int = 24,
+) -> KramersBarrierReport:
+    """
+    Compute the Hamiltonian free-energy activation barrier `Delta_H^dagger = H(x_saddle) - H(x_well)`
+    and the Eyring-Kramers thermally activated escape rate:
+        `k_escape = (sqrt(|lambda_unstable| * lambda_stable) / (2 * pi)) * exp(-Delta_H^dagger / eps_th)`
+    between metastable attractor wells and index-1 saddle points.
+    """
+    import math
+
+    p0 = params.detach().to(torch.float64)
+    if p0.ndim == 1:
+        p0 = p0.unsqueeze(0)
+    p0 = p0[:1]
+
+    landscape = (
+        landscape_report
+        if landscape_report is not None
+        else discover_equilibrium_landscape(brick, p0, num_probes=num_probes)
+    )
+
+    eq_states = landscape.distinct_equilibria
+    n_eq = int(eq_states.shape[0])
+    if n_eq == 0:
+        empty = torch.zeros((0, brick.state_dim), dtype=torch.float64, device=p0.device)
+        empty_e = torch.zeros((0,), dtype=torch.float64, device=p0.device)
+        return KramersBarrierReport(
+            num_wells=0,
+            num_saddles=0,
+            well_states=empty,
+            saddle_states=empty,
+            well_energies=empty_e,
+            saddle_energies=empty_e,
+            energy_barrier_delta_h=0.0,
+            eyring_kramers_escape_rate=0.0,
+            mean_first_passage_time=float("inf"),
+        )
+
+    p_batch = p0.expand(n_eq, -1)
+    with torch.no_grad():
+        energies = brick.hamiltonian_energy(eq_states, p_batch)
+
+    well_indices: list[int] = list(landscape.stable_attractor_indices)
+    saddle_indices: list[int] = list(landscape.unstable_fixed_point_indices)
+    if not well_indices and not saddle_indices:
+        for idx, cls_name in enumerate(landscape.stability_classes):
+            if "unstable" in cls_name:
+                saddle_indices.append(idx)
+            else:
+                well_indices.append(idx)
+
+    # If all equilibria are conservative centers (e.g., undamped pendulum where saddle has positive real eig
+    # and well has purely imaginary eigs), well_indices collects centers/stable nodes and saddle_indices collects saddles.
+    if not well_indices and n_eq > 0:
+        min_idx = int(torch.argmin(energies).item())
+        well_indices.append(min_idx)
+    if not saddle_indices and n_eq >= 2:
+        max_idx = int(torch.argmax(energies).item())
+        if max_idx not in well_indices:
+            saddle_indices.append(max_idx)
+
+    well_states = eq_states[well_indices] if well_indices else eq_states[:0]
+    well_energies = energies[well_indices] if well_indices else energies[:0]
+    saddle_states = eq_states[saddle_indices] if saddle_indices else eq_states[:0]
+    saddle_energies = energies[saddle_indices] if saddle_indices else energies[:0]
+
+    if well_states.shape[0] > 0 and saddle_states.shape[0] > 0:
+        best_well_local = int(torch.argmin(well_energies).item())
+        best_saddle_local = int(torch.argmin(saddle_energies).item())
+        h_well = float(well_energies[best_well_local].item())
+        h_saddle = float(saddle_energies[best_saddle_local].item())
+        delta_h = max(0.0, h_saddle - h_well)
+
+        w_global = well_indices[best_well_local]
+        s_global = saddle_indices[best_saddle_local]
+        lam_well = max(abs(float(landscape.max_real_eigenvalues[w_global].item())), 0.5)
+        lam_saddle = max(abs(float(landscape.max_real_eigenvalues[s_global].item())), 0.5)
+        eps_th = max(float(thermal_energy_scale), 1e-9)
+        prefactor = math.sqrt(lam_well * lam_saddle) / (2.0 * math.pi)
+        k_esc = float(prefactor * math.exp(-min(delta_h / eps_th, 100.0)))
+        mfpt = 1.0 / max(k_esc, 1e-15)
+    else:
+        delta_h = 0.0
+        k_esc = 0.0
+        mfpt = float("inf")
+
+    emit_trace_node(
+        layer="layer4_engine",
+        operation="compute_kramers_barrier_and_escape_rate",
+        target_name=brick.name,
+        selected_expression=(
+            f"wells={len(well_indices)}, saddles={len(saddle_indices)}, "
+            f"Delta_H={delta_h:.4f}, k_escape={k_esc:.4e}"
+        ),
+        metrics={
+            "num_wells": len(well_indices),
+            "num_saddles": len(saddle_indices),
+            "energy_barrier_delta_h": round(delta_h, 6),
+            "eyring_kramers_escape_rate": k_esc,
+        },
+        skip_if_inner_loop=True,
+    )
+
+    return KramersBarrierReport(
+        num_wells=len(well_indices),
+        num_saddles=len(saddle_indices),
+        well_states=well_states,
+        saddle_states=saddle_states,
+        well_energies=well_energies,
+        saddle_energies=saddle_energies,
+        energy_barrier_delta_h=delta_h,
+        eyring_kramers_escape_rate=k_esc,
+        mean_first_passage_time=mfpt,
+    )

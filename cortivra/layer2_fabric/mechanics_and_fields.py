@@ -322,3 +322,193 @@ class NonlinearPendulumAndViscoelasticBrick(LawBrick):
             conductance=damping,
         )
         return r_mat
+
+
+class QuantumSymplecticLindbladBrick(LawBrick):
+    """
+    Open quantum system mapped onto canonical symplectic phase-space quadratures `(q, p)` in `R^{2N}`
+    where the complex wavefunction / coherent-state amplitude is `psi_k = (q_k + i * p_k) / sqrt(2)`.
+
+    In this canonical quadrature representation:
+        - The Born probability norm is `C(q, p) = sum_k |psi_k|^2 = 0.5 * sum_k (q_k^2 + p_k^2)`.
+        - The rotating-frame Rabi-Kerr quantum Hamiltonian is:
+            `H(q, p) = sum_k 0.5 * delta_k * (q_k^2 + p_k^2)`
+            `        + sum_k 0.125 * chi_k * (q_k^2 + p_k^2)^2`
+            `        + sum_{j < k} omega_{jk} * (q_j * q_k + p_j * p_k)`
+        - Unitary Schrodinger-von Neumann evolution corresponds exactly to canonical Hamilton's equations
+          `dq/dt = +grad_p H`, `dp/dt = -grad_q H` with `J = [[0, I_N], [-I_N, 0]]`, which identically
+          conserves both `H(q, p)` and the Born norm `C(q, p)` by U(1) Noether gauge symmetry.
+        - Open-system Lindblad relaxation / dephasing (`T_1 / T_2`) enters via the symmetric positive
+          semi-definite Onsager dissipation matrix `R(q, p) = diag(gamma_0, ..., gamma_{N-1}, gamma_0, ..., gamma_{N-1}) >= 0`.
+
+    State vector (`[Batch, 2 * N]`):
+        - `q_0, ..., q_{N-1}`: In-phase real quadratures (`1`).
+        - `p_0, ..., p_{N-1}`: Out-of-phase imaginary quadratures (`1`).
+
+    Parameters (`[Batch, 3 * N + N*(N-1)/2]`):
+        - `delta_0, ..., delta_{N-1}`: Level detunings / transition frequencies (`> 0`).
+        - `chi_0, ..., chi_{N-1}`: Kerr anharmonicity coefficients (`>= 0`).
+        - `omega_{j}_{k}` (`0 <= j < k < N`): Symmetric Rabi coupling amplitudes.
+        - `gamma_0, ..., gamma_{N-1}`: Lindblad relaxation / dephasing rates (`>= 0`).
+    """
+
+    def __init__(
+        self,
+        name: str = "quantum_symplectic_lindblad",
+        num_levels: int = 2,
+        detunings_default: Sequence[float] | None = None,
+        kerr_default: Sequence[float] | None = None,
+        rabi_coupling_default: float = 0.25,
+        lindblad_gamma_default: float = 0.0,
+        time_unit: Unit = s,
+        energy_unit: Unit = J,
+    ) -> None:
+        if num_levels < 2:
+            raise ValueError("QuantumSymplecticLindbladBrick requires `num_levels >= 2`.")
+        self.num_levels = int(num_levels)
+        n = self.num_levels
+
+        state_specs: list[StateVarSpec] = []
+        for k in range(n):
+            q_def = 1.0 if k == 0 else (0.4 if k == 1 else 0.0)
+            state_specs.append(
+                StateVarSpec(
+                    name=f"q_{k}",
+                    unit=DIMENSIONLESS,
+                    default_value=q_def,
+                    homeostatic_min=-10.0,
+                    homeostatic_max=10.0,
+                    description=f"Level {k} real symplectic quadrature Re(psi_{k}) * sqrt(2)",
+                )
+            )
+        for k in range(n):
+            p_def = 0.2 if k == 0 else (-0.3 if k == 1 else 0.0)
+            state_specs.append(
+                StateVarSpec(
+                    name=f"p_{k}",
+                    unit=DIMENSIONLESS,
+                    default_value=p_def,
+                    homeostatic_min=-10.0,
+                    homeostatic_max=10.0,
+                    description=f"Level {k} imaginary symplectic quadrature Im(psi_{k}) * sqrt(2)",
+                )
+            )
+
+        detunings = (
+            list(detunings_default)
+            if detunings_default is not None
+            else [1.5 + 0.5 * float(k) for k in range(n)]
+        )
+        kerrs = (
+            list(kerr_default)
+            if kerr_default is not None
+            else [0.1 for _ in range(n)]
+        )
+        if len(detunings) != n or len(kerrs) != n:
+            raise ValueError(f"Expected {n} detunings and Kerr coefficients.")
+
+        param_specs: list[ParamSpec] = []
+        for k in range(n):
+            param_specs.append(
+                ParamSpec(f"delta_{k}", energy_unit, default_value=float(detunings[k]), min_value=0.1)
+            )
+        for k in range(n):
+            param_specs.append(
+                ParamSpec(f"chi_{k}", energy_unit, default_value=float(kerrs[k]), min_value=0.0)
+            )
+        self._rabi_pairs: list[tuple[int, int]] = []
+        for j in range(n):
+            for k in range(j + 1, n):
+                self._rabi_pairs.append((j, k))
+                param_specs.append(
+                    ParamSpec(
+                        f"omega_{j}_{k}",
+                        energy_unit,
+                        default_value=float(rabi_coupling_default),
+                        min_value=-0.45,
+                        max_value=0.45,
+                    )
+                )
+        for k in range(n):
+            param_specs.append(
+                ParamSpec(
+                    f"gamma_{k}",
+                    DIMENSIONLESS,
+                    default_value=float(lindblad_gamma_default),
+                    min_value=0.0,
+                )
+            )
+
+        super().__init__(
+            name=name,
+            domain="quantum",
+            state_specs=state_specs,
+            param_specs=param_specs,
+            port_specs=(),
+            time_unit=time_unit,
+            energy_unit=energy_unit,
+        )
+
+    def _unpack(
+        self, state: torch.Tensor, params: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = self.num_levels
+        num_pairs = len(self._rabi_pairs)
+        q = state[:, :n]
+        p = state[:, n : 2 * n]
+        deltas = torch.clamp(params[:, :n], min=1e-4)
+        chis = torch.clamp(params[:, n : 2 * n], min=0.0)
+        omegas = params[:, 2 * n : 2 * n + num_pairs]
+        gammas = torch.clamp(params[:, 2 * n + num_pairs : 3 * n + num_pairs], min=0.0)
+        return q, p, deltas, chis, omegas, gammas
+
+    def born_norm(self, state: torch.Tensor) -> torch.Tensor:
+        """Compute total Born probability norm `sum_k |psi_k|^2 = 0.5 * sum_k (q_k^2 + p_k^2)` (`[Batch]`)."""
+        return 0.5 * torch.sum(state**2, dim=-1)
+
+    def hamiltonian_energy(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        q, p, deltas, chis, omegas, _ = self._unpack(state, params)
+        amp_sq = q**2 + p**2  # 2 * |psi_k|^2
+        h_diag = torch.sum(0.5 * deltas * amp_sq + 0.125 * chis * (amp_sq**2), dim=-1)
+        h_rabi = torch.zeros_like(h_diag)
+        for pair_idx, (j, k) in enumerate(self._rabi_pairs):
+            omega_jk = omegas[:, pair_idx]
+            h_rabi = h_rabi + omega_jk * (q[:, j] * q[:, k] + p[:, j] * p[:, k])
+        return h_diag + h_rabi
+
+    def effort(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        q, p, deltas, chis, omegas, _ = self._unpack(state, params)
+        amp_sq = q**2 + p**2
+        coeff = deltas + 0.5 * chis * amp_sq
+        grad_q = coeff * q
+        grad_p = coeff * p
+        for pair_idx, (j, k) in enumerate(self._rabi_pairs):
+            omega_jk = omegas[:, pair_idx]
+            grad_q = grad_q.clone()
+            grad_p = grad_p.clone()
+            grad_q[:, j] = grad_q[:, j] + omega_jk * q[:, k]
+            grad_q[:, k] = grad_q[:, k] + omega_jk * q[:, j]
+            grad_p[:, j] = grad_p[:, j] + omega_jk * p[:, k]
+            grad_p[:, k] = grad_p[:, k] + omega_jk * p[:, j]
+        return torch.cat([grad_q, grad_p], dim=-1)
+
+    def structure_matrix(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        batch = state.shape[0]
+        n = self.num_levels
+        eye = torch.eye(n, dtype=state.dtype, device=state.device)
+        zeros = torch.zeros((n, n), dtype=state.dtype, device=state.device)
+        top = torch.cat([zeros, eye], dim=-1)
+        bottom = torch.cat([-eye, zeros], dim=-1)
+        j_single = torch.cat([top, bottom], dim=0)
+        return j_single.unsqueeze(0).expand(batch, -1, -1).clone()
+
+    def dissipation_matrix(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        batch = state.shape[0]
+        n = self.num_levels
+        _, _, _, _, _, gammas = self._unpack(state, params)
+        r_mat = torch.zeros((batch, 2 * n, 2 * n), dtype=state.dtype, device=state.device)
+        idx_q = torch.arange(0, n, device=state.device)
+        idx_p = torch.arange(n, 2 * n, device=state.device)
+        r_mat[:, idx_q, idx_q] = gammas
+        r_mat[:, idx_p, idx_p] = gammas
+        return r_mat

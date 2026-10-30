@@ -125,6 +125,22 @@ class PowerPortSpec:
         return (self.effort_unit * self.flow_unit).scale
 
 
+@dataclass(frozen=True)
+class SpatialNode3DSpec:
+    """
+    Universal 3D spatial node descriptor mapping state variables onto continuous
+    `R^3` particle/body coordinates `(x, y, z)` or a 3D compartment center.
+    """
+
+    node_id: str
+    position_state_names: tuple[str, ...] = ()
+    momentum_state_names: tuple[str, ...] = ()
+    fixed_position_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    volume_m3: float = 1.0
+    radius_m: float = 1.0
+    associated_state_names: tuple[str, ...] = ()
+
+
 class LawBrick(ABC):
     """Base class for port-Hamiltonian subsystems operating on batched state tensors `[Batch, StateDim]`."""
 
@@ -138,6 +154,9 @@ class LawBrick(ABC):
         time_unit: Unit = s,
         energy_unit: Unit = J,
         matrix_free: bool = False,
+        thermal_sink_state_name: str | None = None,
+        thermal_capacity_scale: float = 1.0,
+        spatial_nodes_3d: Sequence[SpatialNode3DSpec] = (),
     ) -> None:
         if not state_specs:
             raise ValueError(f"LawBrick '{name}' must define at least one StateVarSpec.")
@@ -154,6 +173,7 @@ class LawBrick(ABC):
         self.time_unit = time_unit
         self.energy_unit = energy_unit
         self.is_matrix_free = matrix_free
+        self.spatial_nodes_3d = tuple(spatial_nodes_3d)
 
         self._state_index = {spec.name: idx for idx, spec in enumerate(self.state_specs)}
         self._param_index = {spec.name: idx for idx, spec in enumerate(self.param_specs)}
@@ -163,6 +183,22 @@ class LawBrick(ABC):
             raise ValueError(f"LawBrick '{name}' has duplicate state variable names.")
         if len(self._param_index) != len(self.param_specs):
             raise ValueError(f"LawBrick '{name}' has duplicate parameter names.")
+
+        if thermal_sink_state_name is not None:
+            if thermal_sink_state_name not in self._state_index:
+                raise ValueError(
+                    f"LawBrick '{name}' thermal_sink_state_name '{thermal_sink_state_name}' "
+                    f"is not in state_specs."
+                )
+            if thermal_capacity_scale <= 0.0:
+                raise ValueError(
+                    f"LawBrick '{name}' thermal_capacity_scale must be positive, got {thermal_capacity_scale}."
+                )
+            self.thermal_sink_index: int | None = self._state_index[thermal_sink_state_name]
+        else:
+            self.thermal_sink_index = None
+        self.thermal_sink_state_name = thermal_sink_state_name
+        self.thermal_capacity_scale = float(thermal_capacity_scale)
 
     @property
     def state_dim(self) -> int:
@@ -284,6 +320,165 @@ class LawBrick(ABC):
         f_diss = self.dissipative_flow(state, params)
         return (e * f_diss).sum(dim=-1)
 
+    def thermal_sink_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """
+        GENERIC 1st-Law internal thermal/entropy production flow vector (`[Batch, StateDim]`).
+        Routes 100% of dissipated free-energy power `D(x) = grad_H(x) . F_diss(x) >= 0` into
+        the designated `thermal_sink_index` scaled by `thermal_capacity_scale = 1 / C_th`.
+        """
+        out = torch.zeros_like(state)
+        if self.thermal_sink_index is not None:
+            diss_p = self.dissipation_power(state, params)
+            out[:, self.thermal_sink_index] = diss_p * self.thermal_capacity_scale
+        return out
+
+    def total_conserved_energy(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """
+        Compute total GENERIC 1st-Law energy `E_total(x) = H_work(x) + E_thermal(x)` (`[Batch]`).
+        For an isolated dissipative system (`P_ext == 0`) with a designated thermal sink state,
+        `dE_total / dt == 0` even as `H_work(x)` dissipates into `E_thermal(x)`.
+        """
+        h_work = self.hamiltonian_energy(state, params)
+        if self.thermal_sink_index is not None:
+            e_th = state[:, self.thermal_sink_index] / self.thermal_capacity_scale
+            return h_work + e_th
+        return h_work
+
+    def extract_3d_coordinates(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Extract universal 3D Euclidean coordinates `(x, y, z)` for all spatial nodes in the system.
+        Accepts `[Batch, StateDim]`, `[Time, StateDim]`, or `[Batch, Time, StateDim]` and returns
+        `[..., NumNodes, 3]`.
+        """
+        lead_shape = state.shape[:-1]
+        flat = state.reshape(-1, self.state_dim)
+        b_flat = flat.shape[0]
+        device, dtype = state.device, state.dtype
+
+        if self.spatial_nodes_3d:
+            nodes_out: list[torch.Tensor] = []
+            for node_spec in self.spatial_nodes_3d:
+                coords = [
+                    torch.full((b_flat,), float(node_spec.fixed_position_m[axis]), dtype=dtype, device=device)
+                    for axis in range(3)
+                ]
+                for axis, st_name in enumerate(node_spec.position_state_names[:3]):
+                    if st_name in self._state_index:
+                        coords[axis] = flat[:, self._state_index[st_name]]
+                nodes_out.append(torch.stack(coords, dim=-1))
+            stacked = torch.stack(nodes_out, dim=1)
+            return stacked.reshape(*lead_shape, len(self.spatial_nodes_3d), 3)
+
+        # Automatic 3D coordinate inference when spatial_nodes_3d is not explicitly specified
+        names = [sp.name for sp in self.state_specs]
+        if {"x", "y", "z"}.issubset(self._state_index):
+            xyz = torch.stack(
+                [flat[:, self._state_index["x"]], flat[:, self._state_index["y"]], flat[:, self._state_index["z"]]],
+                dim=-1,
+            ).unsqueeze(1)
+            return xyz.reshape(*lead_shape, 1, 3)
+        if {"x", "y"}.issubset(self._state_index):
+            xyz = torch.stack(
+                [
+                    flat[:, self._state_index["x"]],
+                    flat[:, self._state_index["y"]],
+                    torch.zeros(b_flat, dtype=dtype, device=device),
+                ],
+                dim=-1,
+            ).unsqueeze(1)
+            return xyz.reshape(*lead_shape, 1, 3)
+
+        # Fallback: embed state phase-space or compartment nodes into R^3
+        if self.state_dim >= 3:
+            xyz = flat[:, :3].unsqueeze(1)
+            return xyz.reshape(*lead_shape, 1, 3)
+        if self.state_dim == 2:
+            xyz = torch.stack(
+                [flat[:, 0], flat[:, 1], torch.zeros(b_flat, dtype=dtype, device=device)],
+                dim=-1,
+            ).unsqueeze(1)
+            return xyz.reshape(*lead_shape, 1, 3)
+        xyz = torch.stack(
+            [
+                flat[:, 0],
+                torch.zeros(b_flat, dtype=dtype, device=device),
+                torch.zeros(b_flat, dtype=dtype, device=device),
+            ],
+            dim=-1,
+        ).unsqueeze(1)
+        return xyz.reshape(*lead_shape, 1, 3)
+
+    def compute_3d_spatial_geometry_summary(
+        self,
+        states: torch.Tensor | None = None,
+    ) -> dict[str, object]:
+        """
+        Compute universal 3D Euclidean compartment geometry, pairwise inter-node distances,
+        geometric Fickian/electrostatic conductance factors `A_ij / d_ij`, and 3D trajectory
+        arc-length / bounding-box kinematics.
+        """
+        nodes_summary: list[dict[str, object]] = []
+        for nd in self.spatial_nodes_3d:
+            nodes_summary.append(
+                {
+                    "node_id": nd.node_id,
+                    "fixed_position_m": [float(f"{float(c):.6g}") for c in nd.fixed_position_m],
+                    "volume_m3": float(f"{float(nd.volume_m3):.6g}"),
+                    "radius_m": float(f"{float(nd.radius_m):.6g}"),
+                    "position_state_names": list(nd.position_state_names),
+                    "associated_state_names": list(nd.associated_state_names),
+                }
+            )
+
+        pairwise_couplings: list[dict[str, object]] = []
+        n_nodes = len(self.spatial_nodes_3d)
+        for i in range(n_nodes):
+            for j in range(i + 1, n_nodes):
+                ni = self.spatial_nodes_3d[i]
+                nj = self.spatial_nodes_3d[j]
+                dx = float(ni.fixed_position_m[0] - nj.fixed_position_m[0])
+                dy = float(ni.fixed_position_m[1] - nj.fixed_position_m[1])
+                dz = float(ni.fixed_position_m[2] - nj.fixed_position_m[2])
+                dist_m = math.sqrt(dx * dx + dy * dy + dz * dz)
+                eff_r = min(float(ni.radius_m), float(nj.radius_m))
+                cross_area_m2 = math.pi * eff_r * eff_r
+                geom_factor_m = cross_area_m2 / max(dist_m, 1e-9) if dist_m > 0.0 else 0.0
+                pairwise_couplings.append(
+                    {
+                        "pair": f"{ni.node_id}<->{nj.node_id}",
+                        "euclidean_distance_m": float(f"{dist_m:.6g}"),
+                        "effective_cross_section_m2": float(f"{cross_area_m2:.6g}"),
+                        "fickian_geometric_conductance_factor_m": float(f"{geom_factor_m:.6g}"),
+                    }
+                )
+
+        kinematics: dict[str, object] = {}
+        if states is not None and states.numel() > 0:
+            s_t = states[0] if states.ndim == 3 else states
+            coords_3d = self.extract_3d_coordinates(s_t)  # [T, NumNodes, 3]
+            if coords_3d.shape[0] >= 2:
+                step_disp = torch.linalg.norm(coords_3d[1:] - coords_3d[:-1], dim=-1)  # [T-1, NumNodes]
+                arc_lengths = torch.sum(step_disp, dim=0)  # [NumNodes]
+                bbox_min = torch.min(coords_3d.reshape(-1, 3), dim=0).values
+                bbox_max = torch.max(coords_3d.reshape(-1, 3), dim=0).values
+                bbox_span = bbox_max - bbox_min
+                kinematics = {
+                    "num_3d_nodes_tracked": int(coords_3d.shape[1]),
+                    "node_arc_lengths_m": [round(float(v), 6) for v in arc_lengths.tolist()],
+                    "bounding_box_span_xyz": [round(float(v), 6) for v in bbox_span.tolist()],
+                }
+                if coords_3d.shape[1] >= 2:
+                    sep_t = torch.linalg.norm(coords_3d[:, 0, :] - coords_3d[:, 1, :], dim=-1)
+                    kinematics["min_inter_node_separation_m"] = round(float(torch.min(sep_t).item()), 6)
+                    kinematics["max_inter_node_separation_m"] = round(float(torch.max(sep_t).item()), 6)
+
+        return {
+            "num_spatial_nodes_3d": n_nodes,
+            "spatial_nodes": nodes_summary,
+            "pairwise_3d_geometric_couplings": pairwise_couplings,
+            "trajectory_3d_kinematics": kinematics,
+        }
+
     def flow(
         self,
         state: torch.Tensor,
@@ -292,6 +487,8 @@ class LawBrick(ABC):
     ) -> torch.Tensor:
         """Compute time derivative `dx/dt` (`[Batch, StateDim]`) in units of `state_unit / time_unit`."""
         dx_dt = self.conservative_flow(state, params) - self.dissipative_flow(state, params)
+        if self.thermal_sink_index is not None:
+            dx_dt = dx_dt + self.thermal_sink_flow(state, params)
         if port_inputs and "external_flow" in port_inputs:
             dx_dt = dx_dt + port_inputs["external_flow"]
         return dx_dt
@@ -445,6 +642,8 @@ class CoupledPortHamiltonianSystem(LawBrick):
         connections: Sequence[PortConnection] = (),
         time_unit: Unit = s,
         energy_unit: Unit = J,
+        thermal_sink_state_name: str | None = None,
+        thermal_capacity_scale: float = 1.0,
     ) -> None:
         if len(bricks) < 1:
             raise ValueError("CoupledPortHamiltonianSystem requires at least one LawBrick.")
@@ -458,6 +657,7 @@ class CoupledPortHamiltonianSystem(LawBrick):
         combined_states: list[StateVarSpec] = []
         combined_params: list[ParamSpec] = []
         combined_ports: list[PowerPortSpec] = []
+        combined_nodes_3d: list[SpatialNode3DSpec] = []
 
         s_offset = 0
         p_offset = 0
@@ -509,6 +709,18 @@ class CoupledPortHamiltonianSystem(LawBrick):
                         description=port.description,
                     )
                 )
+            for n3d in b.spatial_nodes_3d:
+                combined_nodes_3d.append(
+                    SpatialNode3DSpec(
+                        node_id=f"{b.name}.{n3d.node_id}",
+                        position_state_names=tuple(f"{b.name}.{sn}" for sn in n3d.position_state_names),
+                        momentum_state_names=tuple(f"{b.name}.{mn}" for mn in n3d.momentum_state_names),
+                        fixed_position_m=n3d.fixed_position_m,
+                        volume_m3=n3d.volume_m3,
+                        radius_m=n3d.radius_m,
+                        associated_state_names=tuple(f"{b.name}.{an}" for an in n3d.associated_state_names),
+                    )
+                )
 
         super().__init__(
             name=name,
@@ -519,6 +731,9 @@ class CoupledPortHamiltonianSystem(LawBrick):
             time_unit=time_unit,
             energy_unit=energy_unit,
             matrix_free=any(b.is_matrix_free for b in self.bricks),
+            thermal_sink_state_name=thermal_sink_state_name,
+            thermal_capacity_scale=thermal_capacity_scale,
+            spatial_nodes_3d=combined_nodes_3d,
         )
 
         self._time_scales: dict[str, float] = {
@@ -621,3 +836,49 @@ class CoupledPortHamiltonianSystem(LawBrick):
             )
 
         return r_total
+
+    def external_drive_power(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """Aggregate external drive power across all child bricks in system energy/time units."""
+        e = self.effort(state, params)
+        f_ext_parts: list[torch.Tensor] = []
+        for b in self.bricks:
+            s_slice = self._state_slices[b.name]
+            p_slice = self._param_slices[b.name]
+            tau_b = self._time_scales[b.name]
+            x_b = state[:, s_slice]
+            p_b = params[:, p_slice]
+            f_b_total = b.flow(x_b, p_b)
+            f_b_jr = b.conservative_flow(x_b, p_b) - b.dissipative_flow(x_b, p_b)
+            if b.thermal_sink_index is not None:
+                f_b_jr = f_b_jr + b.thermal_sink_flow(x_b, p_b)
+            f_ext_parts.append(tau_b * (f_b_total - f_b_jr))
+        f_ext_vec = torch.cat(f_ext_parts, dim=-1)
+        return (e * f_ext_vec).sum(dim=-1)
+
+    def flow(
+        self,
+        state: torch.Tensor,
+        params: torch.Tensor,
+        port_inputs: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute composite flow `dx/dt` combining Dirac-coupled conservative flows,
+        dissipative flows, child external/thermal flows, and composite thermal sink routing.
+        """
+        dx_dt = self.conservative_flow(state, params) - self.dissipative_flow(state, params)
+        f_extra_parts: list[torch.Tensor] = []
+        for b in self.bricks:
+            s_slice = self._state_slices[b.name]
+            p_slice = self._param_slices[b.name]
+            tau_b = self._time_scales[b.name]
+            x_b = state[:, s_slice]
+            p_b = params[:, p_slice]
+            f_b_total = b.flow(x_b, p_b)
+            f_b_jr = b.conservative_flow(x_b, p_b) - b.dissipative_flow(x_b, p_b)
+            f_extra_parts.append(tau_b * (f_b_total - f_b_jr))
+        dx_dt = dx_dt + torch.cat(f_extra_parts, dim=-1)
+        if self.thermal_sink_index is not None:
+            dx_dt = dx_dt + self.thermal_sink_flow(state, params)
+        if port_inputs and "external_flow" in port_inputs:
+            dx_dt = dx_dt + port_inputs["external_flow"]
+        return dx_dt

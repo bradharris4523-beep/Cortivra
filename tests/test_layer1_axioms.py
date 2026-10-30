@@ -692,4 +692,81 @@ def test_bilinear_residual_detection_and_param_validation() -> None:
     assert res.state_coherence_r2 > 0.99
 
 
+def test_generic_first_law_thermal_sink_conservation_and_3d_spatial_nodes() -> None:
+    """
+    Verify Upgrade 2 (GENERIC 1st-Law Thermal & Entropy Conservation) and
+    Upgrade 3 (Universal 3D Euclidean SE(3) SpatialNode3DSpec):
+      1. Dissipated mechanical free energy D(x) = grad_H . R grad_H >= 0 is routed 100% into
+         the internal thermal sink state E_therm so H_total = H_work + E_therm is conserved.
+      2. SpatialNode3DSpec extracts [Batch, NumNodes, 3] 3D Cartesian coordinates and validates
+         common spatial length dimensions.
+    """
+    from cortivra.layer1_axioms.hamiltonian import SpatialNode3DSpec
+    from cortivra.layer1_axioms.units import J, kg
+    from cortivra.layer3_compiler.symbolic_compiler import SymbolicSystemSpec, compile_symbolic_system
+
+    thermo_spec = SymbolicSystemSpec(
+        name="generic_thermo_oscillator",
+        domain="thermodynamics",
+        state_specs=[
+            StateVarSpec("rx", m, default_value=2.0),
+            StateVarSpec("ry", m, default_value=1.0),
+            StateVarSpec("rz", m, default_value=-0.5),
+            StateVarSpec("px", N_force * s, default_value=0.0),
+            StateVarSpec("py", N_force * s, default_value=1.5),
+            StateVarSpec("pz", N_force * s, default_value=-0.8),
+            StateVarSpec("E_therm", J, default_value=5.0, homeostatic_min=0.0, homeostatic_max=500.0, hard_min=0.0),
+        ],
+        param_specs=[
+            ParamSpec("k_s", N_force / m, default_value=2.5),
+            ParamSpec("inv_m", DIMENSIONLESS / kg, default_value=1.0, tunable=False),
+            ParamSpec("gamma_d", kg / s, default_value=0.8, min_value=0.0),
+        ],
+        time_unit=s,
+        energy_unit=J,
+        hamiltonian_expr="0.5 * k_s * (rx**2 + ry**2 + rz**2) + 0.5 * inv_m * (px**2 + py**2 + pz**2)",
+        dissipation_diag_exprs=("0.0", "0.0", "0.0", "gamma_d", "gamma_d", "gamma_d", "0.0"),
+        skew_routing_exprs={(0, 3): "1.0", (1, 4): "1.0", (2, 5): "1.0"},
+        thermal_sink_state_name="E_therm",
+        thermal_capacity_scale=1.0,
+        spatial_nodes_3d=(
+            SpatialNode3DSpec(
+                node_id="particle_3d",
+                position_state_names=("rx", "ry", "rz"),
+                momentum_state_names=("px", "py", "pz"),
+            ),
+        ),
+    )
+    brick = compile_symbolic_system(thermo_spec)
+    x0 = brick.default_state(batch_size=1, dtype=torch.float64)
+    params = brick.default_params(batch_size=1, dtype=torch.float64)
+
+    coords_3d = brick.extract_3d_coordinates(x0)
+    assert coords_3d.shape == (1, 1, 3)
+    assert torch.allclose(coords_3d[0, 0], torch.tensor([2.0, 1.0, -0.5], dtype=torch.float64))
+
+    cert = audit_law_brick(brick, sample_state=x0, sample_params=params, tol=1e-9)
+    cert.raise_if_failed()
+    assert cert.passed_all
+
+    # Roll out 40 RK4 steps and verify H_work decreases, E_therm increases, and H_total is conserved!
+    x_curr = x0.clone()
+    h_work_0 = float(brick.hamiltonian_energy(x_curr, params).item())
+    e_therm_0 = float(x_curr[0, 6].item())
+    h_tot_0 = float(brick.total_conserved_energy(x_curr, params).item())
+    assert abs(h_tot_0 - (h_work_0 + e_therm_0)) < 1e-12
+
+    for _ in range(40):
+        x_curr = brick.step_rk4(x_curr, params, dt=0.02)
+
+    h_work_end = float(brick.hamiltonian_energy(x_curr, params).item())
+    e_therm_end = float(x_curr[0, 6].item())
+    h_tot_end = float(brick.total_conserved_energy(x_curr, params).item())
+
+    assert h_work_end < h_work_0 - 1.0
+    assert e_therm_end > e_therm_0 + 1.0
+    assert abs(h_tot_end - h_tot_0) < 1e-5
+
+
+
 

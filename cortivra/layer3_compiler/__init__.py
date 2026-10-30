@@ -27,6 +27,7 @@ from cortivra.layer3_compiler.spatial_discretizer import (
     CompartmentGeometry,
     DiscretizedCompartmentGraph,
     HeterogeneousCompartmentTransportBrick,
+    MultiFieldReactionDiffusionPDEBrick,
     build_compartment_graph,
     discretize_labeled_mask,
     make_cuboid_compartment,
@@ -35,6 +36,7 @@ from cortivra.layer3_compiler.spatial_discretizer import (
 )
 from cortivra.layer3_compiler.symbolic_compiler import (
     CompiledLawBrick,
+    OnsagerCouplingSpec,
     ResidualPatchedLawBrick,
     SymbolicSystemSpec,
     build_symbol_table,
@@ -52,6 +54,7 @@ __all__ = [
     "PrimitiveCallNode",
     "parse_symbolic_expr",
     "SymbolicSystemSpec",
+    "OnsagerCouplingSpec",
     "CompiledLawBrick",
     "ResidualPatchedLawBrick",
     "build_symbol_table",
@@ -60,6 +63,7 @@ __all__ = [
     "CompartmentGeometry",
     "DiscretizedCompartmentGraph",
     "HeterogeneousCompartmentTransportBrick",
+    "MultiFieldReactionDiffusionPDEBrick",
     "make_sphere_compartment",
     "make_cylinder_compartment",
     "make_cuboid_compartment",

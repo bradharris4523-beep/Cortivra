@@ -4,6 +4,16 @@ differential epistemic telemetry, active adversarial experimental design, and
 multi-provider AI inference (`Fireworks AI`, `Baseten`, `Meta Model API`).
 """
 
+from cortivra.layer6_agents.blind_reconstruction_benchmarks import (
+    BlindReconstructionBenchmarkResult,
+    BlindReconstructionSuiteReport,
+    run_benchmark_celestial_3d_unseen_perturber_inversion,
+    run_benchmark_excitable_bioelectrical_and_collateral_cure,
+    run_benchmark_locked_pathway_autonomous_catalyst_invention,
+    run_benchmark_non_markovian_hidden_state_and_3d_multifield_pde,
+    run_benchmark_quantum_symplectic_lindblad_and_kramers_escape,
+    run_blind_scientific_reconstruction_suite,
+)
 from cortivra.layer6_agents.council import (
     AutonomousScientificCouncil,
     EpistemicStepRecord,
@@ -12,7 +22,14 @@ from cortivra.layer6_agents.council import (
     ScientificDiscoveryDossier,
     ScientificInvestigationGoal,
     SelfRepairCompilationReport,
+    compile_hypothesis_to_investigation_goal,
     compile_with_self_repair,
+    investigate,
+)
+from cortivra.layer6_agents.empirical_observatory import (
+    EmpiricalTelemetryDataset,
+    fetch_open_science_observatory_telemetry,
+    load_empirical_telemetry,
 )
 from cortivra.layer6_agents.epistemic_telemetry import (
     DifferentialEpistemicBriefing,
@@ -31,7 +48,9 @@ from cortivra.layer6_agents.falsification_and_design import (
     DisambiguatingExperimentReport,
     FalsificationGateResult,
     FalsificationStressReport,
+    LyapunovStabilityCertificate,
     MultiHorizonStabilityReport,
+    compute_lyapunov_stability_certificate,
     crystallize_verified_law,
     design_disambiguating_experiment,
     run_falsification_stress_test,
@@ -71,10 +90,12 @@ __all__ = [
     "search_vault_isomorphisms",
     "format_compiler_or_shield_diagnostic",
     "MultiHorizonStabilityReport",
+    "LyapunovStabilityCertificate",
     "DisambiguatingExperimentReport",
     "FalsificationGateResult",
     "FalsificationStressReport",
     "verify_multi_horizon_stability",
+    "compute_lyapunov_stability_certificate",
     "design_disambiguating_experiment",
     "run_falsification_stress_test",
     "crystallize_verified_law",
@@ -84,6 +105,16 @@ __all__ = [
     "EpistemicStepRecord",
     "ScientificInvestigationGoal",
     "ScientificDiscoveryDossier",
+    "compile_hypothesis_to_investigation_goal",
     "compile_with_self_repair",
     "AutonomousScientificCouncil",
+    "investigate",
+    "BlindReconstructionBenchmarkResult",
+    "BlindReconstructionSuiteReport",
+    "run_benchmark_excitable_bioelectrical_and_collateral_cure",
+    "run_benchmark_celestial_3d_unseen_perturber_inversion",
+    "run_benchmark_locked_pathway_autonomous_catalyst_invention",
+    "run_benchmark_quantum_symplectic_lindblad_and_kramers_escape",
+    "run_benchmark_non_markovian_hidden_state_and_3d_multifield_pde",
+    "run_blind_scientific_reconstruction_suite",
 ]

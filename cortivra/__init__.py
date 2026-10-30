@@ -13,3 +13,21 @@ Cortivra — Multi-scale physics and biology simulation sandbox.
 
 __version__ = "0.1.0"
 __author__ = "Brad Harris"
+
+from cortivra.layer6_agents.council import (
+    AutonomousScientificCouncil,
+    ScientificDiscoveryDossier,
+    ScientificInvestigationGoal,
+    compile_hypothesis_to_investigation_goal,
+    investigate,
+)
+
+__all__ = [
+    "__version__",
+    "__author__",
+    "investigate",
+    "compile_hypothesis_to_investigation_goal",
+    "AutonomousScientificCouncil",
+    "ScientificInvestigationGoal",
+    "ScientificDiscoveryDossier",
+]

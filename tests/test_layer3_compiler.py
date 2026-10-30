@@ -499,3 +499,142 @@ def test_compiled_external_drive_and_property_based_ast_invariants() -> None:
     assert cert.passed_all
     assert rc_brick.total_symbolic_complexity() > 5
 
+
+def test_onsager_off_diagonal_spsd_dissipation_and_3d_euclidean_primitives() -> None:
+    """
+    Verify Upgrade 1 (Off-Diagonal Symmetric Positive Semi-Definite Onsager Dissipative Couplings)
+    and Upgrade 3 (3D Euclidean AST primitives `dist3d`, `inv_dist_pow`, `diffusive_flux`):
+      1. `dissipation_coupling_exprs` and `OnsagerCouplingSpec` construct an exact symmetric PSD
+         dissipation matrix `R(x) = R(x)^T >= 0` with off-diagonal entries `R_{ij}(x) < 0` that
+         conserves `x_0 + x_1` when `stoichiometry == (1.0, -1.0)`.
+      2. `ResidualPatchedLawBrick` supports off-diagonal `(0, 1)` patches in `passive_dissipative` mode.
+      3. `dist3d`, `inv_dist_pow`, and `diffusive_flux` infer exact SI units, evaluate finite tensors,
+         and differentiate symbolically.
+    """
+    from cortivra.layer1_axioms.units import DIMENSIONLESS
+    from cortivra.layer3_compiler.symbolic_compiler import OnsagerCouplingSpec
+
+    onsager_spec = SymbolicSystemSpec(
+        name="onsager_cross_coupled_transport",
+        domain="chemistry",
+        state_specs=[
+            StateVarSpec("c_1", mM, default_value=4.0, homeostatic_min=0.0, homeostatic_max=20.0),
+            StateVarSpec("c_2", mM, default_value=1.0, homeostatic_min=0.0, homeostatic_max=20.0),
+        ],
+        param_specs=[
+            ParamSpec("k_e", J / (mM**2), default_value=1.0),
+            ParamSpec("g_exchange", (mM**2) / (J * s), default_value=0.6, min_value=0.0),
+        ],
+        time_unit=s,
+        energy_unit=J,
+        hamiltonian_expr="0.5 * k_e * (c_1**2 + c_2**2)",
+        dissipation_diag_exprs=("0.0", "0.0"),
+        dissipation_coupling_exprs={(0, 1): "g_exchange"},
+        onsager_couplings=(
+            OnsagerCouplingSpec(
+                stoichiometry=((0, 1.0), (1, -1.0)),
+                conductance_expr="0.2 * g_exchange",
+            ),
+        ),
+    )
+    brick = compile_symbolic_system(onsager_spec)
+    state = brick.default_state(batch_size=2, dtype=torch.float64)
+    params = brick.default_params(batch_size=2, dtype=torch.float64)
+
+    r_mat = brick.dissipation_matrix(state, params)
+    assert torch.allclose(r_mat, r_mat.transpose(-1, -2), atol=1e-12)
+    assert float(r_mat[0, 0, 1].item()) < -0.5  # Off-diagonal Onsager entry is non-zero!
+    eigvals = torch.linalg.eigvalsh(r_mat)
+    assert bool((eigvals >= -1e-12).all().item())
+
+    # Total mass c_1 + c_2 is conserved under symmetric exchange (dc_1/dt + dc_2/dt == 0)
+    flow = brick.flow(state, params)
+    assert torch.allclose(flow[:, 0] + flow[:, 1], torch.zeros_like(flow[:, 0]), atol=1e-12)
+    assert audit_law_brick(brick, sample_state=state, sample_params=params).passed_all
+
+    # Test off-diagonal (0, 1) ResidualPatchedLawBrick in passive_dissipative mode
+    patched_onsager = compile_residual_patch_brick(
+        name="patched_onsager_pair",
+        base_brick=brick,
+        patch_param_specs=[ParamSpec("g_extra", (mM**2) / (J * s), default_value=0.25, min_value=0.0)],
+        thermodynamic_mode="passive_dissipative",
+        patch_expressions={(0, 1): "g_extra"},
+    )
+    p_patched = patched_onsager.default_params(batch_size=2, dtype=torch.float64)
+    assert audit_law_brick(patched_onsager, sample_state=state, sample_params=p_patched).passed_all
+
+    # Test 3D Euclidean AST primitives: dist3d, inv_dist_pow, diffusive_flux
+    syms_3d = {
+        "dx": SymbolNode("dx", m),
+        "dy": SymbolNode("dy", m),
+        "dz": SymbolNode("dz", m),
+        "g_d": SymbolNode("g_d", DIMENSIONLESS / s),
+    }
+    env_3d = {
+        "dx": torch.tensor([3.0, 0.0], dtype=torch.float64),
+        "dy": torch.tensor([4.0, 0.0], dtype=torch.float64),
+        "dz": torch.tensor([0.0, 0.0], dtype=torch.float64),
+        "g_d": torch.tensor([2.0, 2.0], dtype=torch.float64),
+    }
+    dist_node = parse_symbolic_expr("dist3d(dx, dy, dz)", symbol_table=syms_3d)
+    assert dist_node.infer_unit().dimension == m.dimension
+    dist_vals = dist_node.eval_tensor(env_3d)
+    assert abs(float(dist_vals[0].item()) - 5.0) < 1e-6
+    assert float(dist_vals[1].item()) > 0.0  # Singularity-regularized at r=0!
+
+    inv_r2_node = parse_symbolic_expr("inv_dist_pow(dx, dy, dz, 2)", symbol_table=syms_3d)
+    assert inv_r2_node.infer_unit().dimension == (DIMENSIONLESS / (m**2)).dimension
+    inv_vals = inv_r2_node.eval_tensor(env_3d)
+    assert abs(float(inv_vals[0].item()) - 0.04) < 1e-5
+    assert torch.isfinite(inv_r2_node.diff("dx").eval_tensor(env_3d)).all()
+
+    flux_node = parse_symbolic_expr("diffusive_flux(dx, dy, g_d)", symbol_table=syms_3d)
+    assert flux_node.infer_unit().dimension == (m / s).dimension
+    assert abs(float(flux_node.eval_tensor(env_3d)[0].item()) - 2.0) < 1e-9
+
+
+def test_multifield_reaction_diffusion_pde_brick_mass_conservation_and_kinetics() -> None:
+    """
+    Verify Horizon 4 (`MultiFieldReactionDiffusionPDEBrick` and `to_multifield_reaction_diffusion_brick`):
+        1. Differential per-species diffusion (`D_u != D_v`) across heterogeneous compartment volumes
+           conserves exact mass per species (`sum_i M_{s, i}`) when `k_exchange == 0` and passes `audit_law_brick`.
+        2. Reversible Onsager inter-species conversion (`k_exchange > 0`) conserves total combined mass
+           `sum_{s, i} M_{s, i}` while satisfying `R = R^T >= 0`.
+        3. Local symbolic reaction kinetics (`reaction_exprs`) evaluate across all spatial nodes.
+    """
+    from cortivra.layer3_compiler import build_compartment_graph, make_sphere_compartment
+
+    c0 = make_sphere_compartment("node_0", Quantity(5.0, um))
+    c1 = make_sphere_compartment("node_1", Quantity(8.0, um))
+    c2 = make_sphere_compartment("node_2", Quantity(6.0, um))
+    graph = build_compartment_graph([c0, c1, c2], edges=[(0, 1), (1, 2)])
+
+    mf_brick = graph.to_multifield_reaction_diffusion_brick(
+        name="turing_two_species_pde",
+        species_names=("u", "v"),
+        diffusivities_default=(0.1, 1.5),
+        inter_species_exchange_default=0.0,
+    )
+    x0 = mf_brick.default_state(batch_size=1, dtype=torch.float64)
+    p0 = mf_brick.default_params(batch_size=1, dtype=torch.float64)
+    assert audit_law_brick(mf_brick, sample_state=x0, sample_params=p0).passed_all
+
+    # Pure differential diffusion conserves mass of species u and species v independently
+    masses_0 = mf_brick.species_masses(x0)
+    x_diff = x0.clone()
+    for _ in range(25):
+        x_diff = mf_brick.step_rk4(x_diff, p0, dt=0.04)
+    masses_1 = mf_brick.species_masses(x_diff)
+    assert torch.allclose(masses_1, masses_0, atol=1e-12)
+
+    # Reversible inter-species exchange conserves total combined mass (mass_u + mass_v)
+    p_ex = p0.clone()
+    p_ex[:, 2] = 0.4  # k_exchange = 0.4
+    assert audit_law_brick(mf_brick, sample_state=x0, sample_params=p_ex).passed_all
+    x_ex = x0.clone()
+    for _ in range(25):
+        x_ex = mf_brick.step_rk4(x_ex, p_ex, dt=0.04)
+    assert abs(float(mf_brick.species_masses(x_ex).sum().item() - masses_0.sum().item())) < 1e-12
+
+
+

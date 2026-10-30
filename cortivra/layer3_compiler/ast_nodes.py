@@ -35,8 +35,10 @@ from cortivra.layer2_fabric.primitives import (
     boltzmann_partition_switch,
     cooperative_hill_saturation,
     cubic_bistable_feedback,
+    euclidean_distance_3d,
     eyring_barrier_rate,
     ghk_electrodiffusion_flux,
+    inverse_distance_power_3d,
     linear_relaxation_rate,
     nernst_equilibrium_potential_mv,
     ohmic_dissipative_driving_force,
@@ -566,6 +568,10 @@ _PRIMITIVE_ALIASES: dict[str, str] = {
     "saturating_drive": "saturating_drive",
     "impulse": "impulse",
     "surrogate_impulse": "impulse",
+    "dist3d": "dist3d",
+    "euclidean_dist": "dist3d",
+    "inv_dist_pow": "inv_dist_pow",
+    "diffusive_flux": "diffusive_flux",
 }
 
 
@@ -754,6 +760,47 @@ class PrimitiveCallNode(ExprNode):
                 raise DimensionError("impulse(x, x_th) state and threshold must share dimensions.")
             return DIMENSIONLESS
 
+        if name == "dist3d":
+            if len(a) not in (2, 3):
+                raise SymbolicCompilationError("dist3d(dx, dy[, dz]) requires 2 or 3 coordinate difference arguments.")
+            u0 = a[0].infer_unit()
+            for arg in a[1:]:
+                if arg.infer_unit().dimension != u0.dimension:
+                    raise DimensionError(
+                        f"dist3d arguments must share spatial dimension {u0.dimension.format_si()}, "
+                        f"got {arg.infer_unit().dimension.format_si()}."
+                    )
+            return u0
+
+        if name == "inv_dist_pow":
+            if len(a) not in (3, 4):
+                raise SymbolicCompilationError(
+                    "inv_dist_pow(dx, dy[, dz], p) requires 3 (2D + p) or 4 (3D + p) arguments."
+                )
+            coord_args = a[:-1]
+            p_node = a[-1]
+            if p_node.infer_unit().dimension != DIM_DIMENSIONLESS:
+                raise DimensionError("inv_dist_pow exponent 'p' must be dimensionless.")
+            u0 = coord_args[0].infer_unit()
+            for arg in coord_args[1:]:
+                if arg.infer_unit().dimension != u0.dimension:
+                    raise DimensionError(
+                        f"inv_dist_pow coordinate arguments must share dimension {u0.dimension.format_si()}."
+                    )
+            p_val = p_node.value * p_node.unit.scale if isinstance(p_node, ConstNode) else 1.0
+            return u0 ** (-p_val)
+
+        if name == "diffusive_flux":
+            if len(a) != 3:
+                raise SymbolicCompilationError("diffusive_flux(u_i, u_j, k_diff) requires 3 arguments.")
+            u_i, u_j, u_k = a[0].infer_unit(), a[1].infer_unit(), a[2].infer_unit()
+            if u_i.dimension != u_j.dimension:
+                raise DimensionError(
+                    f"diffusive_flux(u_i, u_j, k_diff) requires u_i and u_j to share dimensions, "
+                    f"got {u_i.dimension.format_si()} vs {u_j.dimension.format_si()}."
+                )
+            return u_k * u_i
+
         raise SymbolicCompilationError(f"Unknown primitive call '{name}'.")
 
     def eval_tensor(self, env: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -856,6 +903,30 @@ class PrimitiveCallNode(ExprNode):
             x_th = a[1].evaluate_in_unit(env, u_x)
             beta = float(a[2].value) if (len(a) == 3 and isinstance(a[2], ConstNode)) else 1.0
             return surrogate_event_impulse(x, x_th, sharpness_beta=beta)
+
+        if name == "dist3d":
+            u0 = a[0].infer_unit()
+            dx = a[0].eval_tensor(env)
+            dy = a[1].evaluate_in_unit(env, u0)
+            dz = a[2].evaluate_in_unit(env, u0) if len(a) == 3 else 0.0
+            return euclidean_distance_3d(dx, dy, dz)
+
+        if name == "inv_dist_pow":
+            coord_args = a[:-1]
+            p_node = a[-1]
+            u0 = coord_args[0].infer_unit()
+            dx = coord_args[0].eval_tensor(env)
+            dy = coord_args[1].evaluate_in_unit(env, u0)
+            dz = coord_args[2].evaluate_in_unit(env, u0) if len(coord_args) == 3 else 0.0
+            p_val = float(p_node.value * p_node.unit.scale) if isinstance(p_node, ConstNode) else 1.0
+            return inverse_distance_power_3d(dx, dy, dz, power_p=p_val)
+
+        if name == "diffusive_flux":
+            u_i = a[0].infer_unit()
+            val_i = a[0].eval_tensor(env)
+            val_j = a[1].evaluate_in_unit(env, u_i)
+            k_diff = a[2].eval_tensor(env)
+            return k_diff * (val_j - val_i)
 
         raise SymbolicCompilationError(f"Unknown primitive call '{name}'.")
 
@@ -972,6 +1043,31 @@ class PrimitiveCallNode(ExprNode):
             sig = PrimitiveCallNode("boltzmann", (a[0], a[1], k_node))
             one_minus_sig = BinaryOpNode("-", ConstNode(1.0, DIMENSIONLESS), sig)
             expanded = BinaryOpNode("*", ConstNode(beta_val, DIMENSIONLESS), BinaryOpNode("*", sig, one_minus_sig))
+            return expanded.diff(var_name)
+
+        if name == "dist3d":
+            u0 = a[0].infer_unit()
+            eps_sq = ConstNode(1e-12, u0 ** 2)
+            sum_sq = BinaryOpNode(
+                "+",
+                BinaryOpNode("**", a[0], ConstNode(2.0, DIMENSIONLESS)),
+                BinaryOpNode("**", a[1], ConstNode(2.0, DIMENSIONLESS)),
+            )
+            if len(a) == 3:
+                sum_sq = BinaryOpNode("+", sum_sq, BinaryOpNode("**", a[2], ConstNode(2.0, DIMENSIONLESS)))
+            sum_sq = BinaryOpNode("+", sum_sq, eps_sq)
+            return UnaryOpNode("sqrt", sum_sq).diff(var_name)
+
+        if name == "inv_dist_pow":
+            coord_args = a[:-1]
+            p_node = a[-1]
+            p_val = float(p_node.value * p_node.unit.scale) if isinstance(p_node, ConstNode) else 1.0
+            dist_node = PrimitiveCallNode("dist3d", coord_args)
+            expanded = BinaryOpNode("**", dist_node, ConstNode(-p_val, DIMENSIONLESS))
+            return expanded.diff(var_name)
+
+        if name == "diffusive_flux":
+            expanded = BinaryOpNode("*", a[2], BinaryOpNode("-", a[1], a[0]))
             return expanded.diff(var_name)
 
         raise SymbolicCompilationError(f"Symbolic diff not defined for primitive '{name}'; use PyTorch autograd.")

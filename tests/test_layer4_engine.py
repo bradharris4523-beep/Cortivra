@@ -631,3 +631,216 @@ def test_multi_experiment_dose_response_ensemble_and_lm_machine_precision() -> N
     assert not cal.latent_mechanism_required
 
 
+def test_universal_collateral_equilibrium_and_lyapunov_shielding() -> None:
+    """
+    Verify Upgrade 5a (Universal Collateral Equilibrium & Lyapunov Stability Shielding):
+    When optimizing an intervention to drive target state `x_0` to `1.0`, a shared global
+    parameter `u_shared` perturbs both `x_0` and collateral state `x_1`, whereas `u_selective`
+    only acts on `x_0`. Passing `collateral_state_indices=[1]` shields `x_1` so its drift from
+    baseline equilibrium stays near zero.
+    """
+    spec = SymbolicSystemSpec(
+        name="selective_vs_collateral_pathway",
+        domain="chemistry",
+        state_specs=[
+            StateVarSpec("x_target", DIMENSIONLESS, default_value=3.0, homeostatic_min=0.0, homeostatic_max=10.0),
+            StateVarSpec("x_collateral", DIMENSIONLESS, default_value=2.0, homeostatic_min=0.0, homeostatic_max=10.0),
+        ],
+        param_specs=[
+            ParamSpec("k_clear", DIMENSIONLESS / s, default_value=1.0, min_value=0.2, max_value=5.0, tunable=False),
+            ParamSpec("u_shared", DIMENSIONLESS / s, default_value=2.0, min_value=0.0, max_value=8.0, tunable=True),
+            ParamSpec("u_selective", DIMENSIONLESS / s, default_value=1.0, min_value=-2.0, max_value=6.0, tunable=True),
+        ],
+        time_unit=s,
+        energy_unit=DIMENSIONLESS,
+        hamiltonian_expr="0.0",
+        external_drive_exprs=(
+            "u_shared + u_selective - k_clear * x_target",
+            "u_shared - k_clear * x_collateral",
+        ),
+    )
+    brick = compile_symbolic_system(spec)
+    x0 = brick.default_state(batch_size=1, dtype=torch.float64)
+    p_base = brick.default_params(batch_size=1, dtype=torch.float64)
+
+    def _loss_x0(roll: object) -> torch.Tensor:
+        from cortivra.layer4_engine.rollout_arena import RolloutResult
+        assert isinstance(roll, RolloutResult)
+        return torch.mean((roll.states[:, -5:, 0] - 1.0) ** 2)
+
+    shielded_sol = solve_target_intervention(
+        brick=brick,
+        initial_state=x0,
+        baseline_params=p_base,
+        dt=0.08,
+        num_steps=35,
+        target_loss_fn=_loss_x0,
+        collateral_state_indices=[1],
+        collateral_weight=15.0,
+        collateral_tolerance_sigma=0.05,
+        max_iters=90,
+        learning_rate=0.15,
+    )
+    assert shielded_sol.intervened_loss < 0.05
+    # Collateral state x_collateral must remain tightly anchored near its baseline equilibrium 2.0!
+    final_collateral = float(shielded_sol.restored_rollout.states[0, -1, 1].item())
+    assert abs(final_collateral - 2.0) < 0.15
+    assert shielded_sol.collateral_max_drift < 0.25
+
+
+def test_fluctuation_dissipation_langevin_ensemble_and_kramers_barrier_escape() -> None:
+    """
+    Verify Horizon 2 (`rollout_stochastic_langevin_ensemble` and `compute_kramers_barrier_and_escape_rate`):
+        1. In a canonical mechanical system (`R = diag(0, damping)`), thermal Langevin noise enters
+           ONLY momentum `p` while conservative position `q` receives zero direct noise injection
+           (`max_conservative_noise_leakage == 0.0`).
+        2. On a bistable double-well Hamiltonian `H(x) = 0.25 * x^4 - 0.5 * x^2 + 0.25`,
+           `compute_kramers_barrier_and_escape_rate` discovers the two wells (`x = +-1`, `H = 0`)
+           and the saddle (`x = 0`, `H = 0.25`), returning the exact barrier `Delta_H = 0.25`
+           and positive Eyring-Kramers escape rate.
+    """
+    from cortivra.layer4_engine import (
+        compute_kramers_barrier_and_escape_rate,
+        rollout_stochastic_langevin_ensemble,
+    )
+
+    osc = CanonicalHamiltonianBrick(k_default=2.0, m_default=1.0, damping_default=0.25)
+    x0 = osc.default_state(batch_size=1, dtype=torch.float64)
+    p0 = osc.default_params(batch_size=1, dtype=torch.float64)
+
+    sde_res = rollout_stochastic_langevin_ensemble(
+        brick=osc,
+        initial_state=x0,
+        params=p0,
+        dt=0.02,
+        num_steps=25,
+        thermal_energy_scale=0.05,
+        num_trajectories=12,
+        seed=123,
+    )
+    assert sde_res.ensemble_states.shape == (12, 26, 2)
+    assert sde_res.max_conservative_noise_leakage == 0.0
+    assert sde_res.viable_fraction == 1.0
+    assert float(torch.max(sde_res.std_trajectory[:, 1]).item()) > 1e-3
+
+    # Double-well Hamiltonian H(x) = 0.25 * x^4 - 0.5 * x^2 + 0.25 >= 0
+    dw_spec = SymbolicSystemSpec(
+        name="quartic_double_well",
+        domain="mechanics",
+        state_specs=[
+            StateVarSpec("x", DIMENSIONLESS, default_value=0.8, homeostatic_min=-4.0, homeostatic_max=4.0),
+        ],
+        param_specs=[
+            ParamSpec("gamma", DIMENSIONLESS / s, default_value=1.0, min_value=0.1, max_value=10.0),
+        ],
+        time_unit=s,
+        energy_unit=DIMENSIONLESS,
+        hamiltonian_expr="0.25 * (x^4) - 0.5 * (x^2) + 0.25",
+        dissipation_diag_exprs=["gamma"],
+    )
+    dw_brick = compile_symbolic_system(dw_spec)
+    p_dw = dw_brick.default_params(batch_size=1, dtype=torch.float64)
+
+    kramers = compute_kramers_barrier_and_escape_rate(
+        brick=dw_brick,
+        params=p_dw,
+        thermal_energy_scale=0.1,
+        num_probes=24,
+    )
+    assert kramers.num_wells >= 2
+    assert kramers.num_saddles >= 1
+    assert abs(kramers.energy_barrier_delta_h - 0.25) < 1e-4
+    assert kramers.eyring_kramers_escape_rate > 0.0
+    assert kramers.mean_first_passage_time < 1e6
+
+
+def test_stiff_rosenbrock2_implicit_midpoint_and_savitzky_golay_denoising() -> None:
+    """
+    Verify the Adversarial Hardening upgrades in Layer 4:
+        1. On a 1000:1 stiff multi-timescale system (`k_fast = 500 s^-1`, `k_slow = 0.5 s^-1`)
+           with macroscopic step `dt = 0.02 s` (`k_fast * dt = 10.0`, far beyond the explicit RK4
+           stability limit `2.785`), `select_optimal_integrator` automatically selects `'rosenbrock2'`,
+           and both `'rosenbrock2'` and `'implicit_midpoint'` remain 100% stable, viable, and
+           end-to-end differentiable (`loss.backward()`).
+        2. On a trajectory corrupted by additive state measurement noise, `estimate_trajectory_noise_std`
+           detects the noise floor and `savitzky_golay_denoise_and_differentiate` (plus
+           `estimate_trajectory_derivatives(..., denoise='auto')`) slashes derivative estimation error
+           compared to raw finite differences.
+    """
+    from cortivra.layer4_engine import (
+        estimate_trajectory_noise_std,
+        savitzky_golay_denoise_and_differentiate,
+    )
+
+    stiff_spec = SymbolicSystemSpec(
+        name="stiff_1000_to_1_relaxation",
+        domain="chemistry",
+        state_specs=[
+            StateVarSpec("x_fast", DIMENSIONLESS, default_value=2.0, homeostatic_min=-10.0, homeostatic_max=10.0),
+            StateVarSpec("x_slow", DIMENSIONLESS, default_value=1.5, homeostatic_min=-10.0, homeostatic_max=10.0),
+        ],
+        param_specs=[
+            ParamSpec("k_fast", DIMENSIONLESS / s, default_value=500.0, min_value=10.0, max_value=2000.0),
+            ParamSpec("k_slow", DIMENSIONLESS / s, default_value=0.5, min_value=0.05, max_value=10.0),
+        ],
+        time_unit=s,
+        energy_unit=DIMENSIONLESS,
+        hamiltonian_expr="0.5 * (x_fast^2 + x_slow^2)",
+        dissipation_diag_exprs=["k_fast", "k_slow"],
+    )
+    stiff_brick = compile_symbolic_system(stiff_spec)
+    x0 = stiff_brick.default_state(batch_size=1, dtype=torch.float64)
+    p0 = stiff_brick.default_params(batch_size=1, dtype=torch.float64).requires_grad_(True)
+    dt_stiff = 0.02  # k_fast * dt = 10.0 >> 2.785 (explicit RK4 blows up)
+
+    assert select_optimal_integrator(stiff_brick, x0, p0, dt=dt_stiff) == "rosenbrock2"
+
+    ros_roll = rollout_trajectories(
+        stiff_brick, x0, p0, dt=dt_stiff, num_steps=25, integrator="rosenbrock2"
+    )
+    assert ros_roll.viable_fraction == 1.0
+    assert bool(torch.isfinite(ros_roll.states).all().item())
+    # x_fast must rapidly relax toward 0 without oscillating or exploding
+    assert abs(float(ros_roll.states[0, -1, 0].item())) < 1e-2
+    loss_ros = torch.sum(ros_roll.states[:, -1, :] ** 2)
+    loss_ros.backward()
+    assert p0.grad is not None and bool(torch.isfinite(p0.grad).all().item())
+
+    p_im = stiff_brick.default_params(batch_size=1, dtype=torch.float64).requires_grad_(True)
+    im_roll = rollout_trajectories(
+        stiff_brick, x0, p_im, dt=dt_stiff, num_steps=25, integrator="implicit_midpoint"
+    )
+    assert im_roll.viable_fraction == 1.0
+    assert bool(torch.isfinite(im_roll.states).all().item())
+    loss_im = torch.sum(im_roll.states[:, -1, :] ** 2)
+    loss_im.backward()
+    assert p_im.grad is not None and bool(torch.isfinite(p_im.grad).all().item())
+
+    # Part 2: Savitzky-Golay denoising & derivative projection under state measurement noise
+    t_grid = torch.linspace(0.0, 2.0 * 3.141592653589793, 81, dtype=torch.float64)
+    dt_sg = float((t_grid[1] - t_grid[0]).item())
+    clean_x = torch.stack([torch.sin(t_grid), torch.cos(t_grid)], dim=-1)
+    true_dx = torch.stack([torch.cos(t_grid), -torch.sin(t_grid)], dim=-1)
+
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(42)
+    noisy_x = clean_x + 0.04 * torch.randn(clean_x.shape, generator=gen, dtype=torch.float64)
+
+    est_std = estimate_trajectory_noise_std(noisy_x)
+    assert est_std > 0.015
+
+    raw_fd_dx = estimate_trajectory_derivatives(noisy_x, dt=dt_sg, denoise=False)
+    auto_sg_dx = estimate_trajectory_derivatives(noisy_x, dt=dt_sg, denoise="auto")
+    x_smooth, sg_dx = savitzky_golay_denoise_and_differentiate(noisy_x, dt=dt_sg, window_length=11, poly_order=3)
+
+    raw_err = float(torch.sqrt(torch.mean((raw_fd_dx - true_dx) ** 2)).item())
+    sg_err = float(torch.sqrt(torch.mean((sg_dx - true_dx) ** 2)).item())
+    auto_err = float(torch.sqrt(torch.mean((auto_sg_dx - true_dx) ** 2)).item())
+    assert sg_err < raw_err * 0.45
+    assert auto_err < raw_err * 0.55
+    assert float(torch.sqrt(torch.mean((x_smooth - clean_x) ** 2)).item()) < 0.03
+
+
+
+
+

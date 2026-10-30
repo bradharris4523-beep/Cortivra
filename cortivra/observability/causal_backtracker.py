@@ -528,10 +528,25 @@ def _score_node_vulnerability(
         3. Local-to-global error divergence (`local_r2` vs `global_r2`).
         4. Symbolic overlap with `dominant_symbol` (the term/parameter responsible for downstream failure).
     """
-    cond = node.operator_spectrum.condition_number if node.operator_spectrum is not None else 1.0
-    eff_rank = node.operator_spectrum.effective_rank if node.operator_spectrum is not None else 1
-    mat_cols = node.operator_spectrum.matrix_shape[1] if node.operator_spectrum is not None else 1
-    rank_deficit = max(mat_cols - eff_rank, 0)
+    is_nullspace_discovery = node.operation in (
+        "discover_dimensionless_groups",
+        "discover_conservation_invariants",
+    )
+    if is_nullspace_discovery and node.operator_spectrum is not None:
+        sv = node.operator_spectrum.singular_values
+        eff_r = node.operator_spectrum.effective_rank
+        if sv and eff_r >= 1 and eff_r <= len(sv):
+            cond = max(sv[0], 1e-15) / max(sv[eff_r - 1], 1e-15)
+        else:
+            cond = 1.0
+        eff_rank = eff_r
+        mat_cols = node.operator_spectrum.matrix_shape[1]
+        rank_deficit = 0
+    else:
+        cond = node.operator_spectrum.condition_number if node.operator_spectrum is not None else 1.0
+        eff_rank = node.operator_spectrum.effective_rank if node.operator_spectrum is not None else 1
+        mat_cols = node.operator_spectrum.matrix_shape[1] if node.operator_spectrum is not None else 1
+        rank_deficit = max(mat_cols - eff_rank, 0)
 
     cond_score = min(math.log10(max(cond, 1.0)) / 10.0, 1.0)
     rank_score = min(float(rank_deficit) * 0.25, 0.75)

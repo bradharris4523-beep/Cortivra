@@ -313,6 +313,230 @@ class HeterogeneousCompartmentTransportBrick(LawBrick):
         return r_mat
 
 
+class MultiFieldReactionDiffusionPDEBrick(LawBrick):
+    """
+    Multi-species 2D/3D Finite-Volume Reaction-Diffusion PDE `LawBrick` across `S >= 2`
+    interacting fields (`species_names`) on an `N`-compartment spatial graph or voxel mesh.
+
+    State vector layout (`[Batch, S * N]`):
+        - Species-major ordering: `[s0_node0, ..., s0_node{N-1}, s1_node0, ..., s{S-1}_node{N-1}]`
+          where each state `M_{s, i} = v_rel_i * c_{s, i}` is extensive scaled amount.
+
+    Thermodynamic & Port-Hamiltonian structure:
+        - Stored chemical free energy:
+            `H(M) = sum_{s=0}^{S-1} sum_{i=0}^{N-1} 0.5 * (M_{s, i}^2 / v_rel_i)`
+        - Conjugate intensive chemical potentials / concentrations:
+            `e_{s, i} = dH / dM_{s, i} = M_{s, i} / v_rel_i = c_{s, i}`
+        - Symmetric PSD Onsager dissipation matrix `R(M) = R(M)^T >= 0`:
+            1. Per-species differential spatial diffusion `blkdiag(D_0 * L_G, ..., D_{S-1} * L_G)`
+               preserving exact per-species mass `sum_i M_{s, i}` under diffusion.
+            2. Local reversible inter-species Onsager conversion (`s_0 <-> s_1`) at each node `i`
+               with rate `k_exchange >= 0`, preserving total combined mass `sum_{s, i} M_{s, i}`.
+        - Optional local symbolic reaction kinetics `reaction_exprs` (e.g. Turing activator-inhibitor
+          morphogenesis or nonlinear cellular kinetics) evaluated identically across all `N` nodes.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        volumes_m3: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_geometric_factors_m: torch.Tensor,
+        species_names: Sequence[str] = ("u", "v"),
+        diffusivities_default: Sequence[float] = (0.1, 1.0),
+        inter_species_exchange_default: float = 0.0,
+        reaction_exprs: Sequence[str] | None = None,
+        reaction_param_specs: Sequence[ParamSpec] = (),
+        state_unit: Unit = mM,
+        time_unit: Unit = s,
+    ) -> None:
+        from cortivra.layer3_compiler.ast_nodes import ExprNode, parse_symbolic_expr
+
+        num_species = len(species_names)
+        if num_species < 2:
+            raise ValueError("MultiFieldReactionDiffusionPDEBrick requires at least 2 species.")
+        if len(diffusivities_default) != num_species:
+            raise ValueError(
+                f"Expected {num_species} diffusivities_default, got {len(diffusivities_default)}."
+            )
+        n_nodes = int(volumes_m3.numel())
+        if n_nodes < 1:
+            raise ValueError("MultiFieldReactionDiffusionPDEBrick requires at least 1 compartment.")
+
+        self.species_names = tuple(str(s_name) for s_name in species_names)
+        self.num_species = num_species
+        self.num_nodes = n_nodes
+
+        v_mean = float(torch.mean(volumes_m3).item())
+        self.relative_volumes = (volumes_m3.to(torch.float64) / max(v_mean, 1e-30)).clone()
+        self.edge_index = edge_index.to(torch.long).clone()
+        g_mean = (
+            float(torch.mean(edge_geometric_factors_m).item())
+            if edge_geometric_factors_m.numel() > 0
+            else 1.0
+        )
+        self.normalized_edge_conductances = (
+            edge_geometric_factors_m.to(torch.float64) / max(g_mean, 1e-30)
+        ).clone()
+
+        state_specs: list[StateVarSpec] = []
+        for s_idx, s_name in enumerate(self.species_names):
+            for i in range(n_nodes):
+                val_def = (1.2 if i == 0 else 0.4) if s_idx == 0 else (0.3 if i == 0 else 0.8)
+                state_specs.append(
+                    StateVarSpec(
+                        name=f"{s_name}_{i}",
+                        unit=state_unit,
+                        default_value=val_def,
+                        hard_min=0.0,
+                        homeostatic_min=0.0,
+                        homeostatic_max=1e5,
+                    )
+                )
+
+        param_specs: list[ParamSpec] = [
+            ParamSpec(
+                name=f"D_{s_name}",
+                unit=DIMENSIONLESS,
+                default_value=float(diffusivities_default[s_idx]),
+                min_value=0.0,
+                max_value=1e6,
+            )
+            for s_idx, s_name in enumerate(self.species_names)
+        ]
+        param_specs.append(
+            ParamSpec(
+                name="k_exchange",
+                unit=DIMENSIONLESS,
+                default_value=float(inter_species_exchange_default),
+                min_value=0.0,
+                max_value=1e5,
+            )
+        )
+        self._reaction_param_specs = tuple(reaction_param_specs)
+        param_specs.extend(self._reaction_param_specs)
+
+        self._reaction_nodes: tuple[ExprNode, ...] = ()
+        if reaction_exprs is not None:
+            if len(reaction_exprs) != num_species:
+                raise ValueError(
+                    f"Expected {num_species} reaction_exprs, got {len(reaction_exprs)}."
+                )
+            self._reaction_nodes = tuple(
+                parse_symbolic_expr(expr) if isinstance(expr, str) else expr
+                for expr in reaction_exprs
+            )
+
+        super().__init__(
+            name=name,
+            domain="transport",
+            state_specs=state_specs,
+            param_specs=param_specs,
+            port_specs=(),
+            time_unit=time_unit,
+            energy_unit=DIMENSIONLESS,
+            matrix_free=False,
+        )
+
+    def intensive_concentrations(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Return intensive species concentrations `c_{s, i} = M_{s, i} / v_rel_i` shaped
+        `[Batch, NumSpecies, NumNodes]`.
+        """
+        batch = state.shape[0]
+        m_reshaped = state.view(batch, self.num_species, self.num_nodes)
+        v_rel = self.relative_volumes.to(dtype=state.dtype, device=state.device).view(1, 1, self.num_nodes)
+        return m_reshaped / torch.clamp(v_rel, min=1e-18)
+
+    def species_masses(self, state: torch.Tensor) -> torch.Tensor:
+        """Compute total extensive mass `sum_{i=0}^{N-1} M_{s, i}` for each species `s` (`[Batch, NumSpecies]`)."""
+        batch = state.shape[0]
+        m_reshaped = state.view(batch, self.num_species, self.num_nodes)
+        return torch.sum(m_reshaped, dim=-1)
+
+    def hamiltonian_energy(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        batch = state.shape[0]
+        m_reshaped = state.view(batch, self.num_species, self.num_nodes)
+        v_rel = self.relative_volumes.to(dtype=state.dtype, device=state.device).view(1, 1, self.num_nodes)
+        return 0.5 * torch.sum((m_reshaped**2) / torch.clamp(v_rel, min=1e-18), dim=(1, 2))
+
+    def effort(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        return self.intensive_concentrations(state).reshape(state.shape[0], self.state_dim)
+
+    def dissipation_matrix(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        batch = state.shape[0]
+        s_cnt = self.num_species
+        n = self.num_nodes
+        total_dim = s_cnt * n
+        r_mat = torch.zeros((batch, total_dim, total_dim), dtype=state.dtype, device=state.device)
+
+        g_vec = self.normalized_edge_conductances.to(dtype=state.dtype, device=state.device)
+        for s_idx in range(s_cnt):
+            d_s = torch.clamp(params[:, s_idx], min=0.0)
+            offset = s_idx * n
+            for e_idx in range(self.edge_index.shape[1]):
+                i = offset + int(self.edge_index[0, e_idx].item())
+                j = offset + int(self.edge_index[1, e_idx].item())
+                w = d_s * g_vec[e_idx]
+                r_mat[:, i, i] = r_mat[:, i, i] + w
+                r_mat[:, j, j] = r_mat[:, j, j] + w
+                r_mat[:, i, j] = r_mat[:, i, j] - w
+                r_mat[:, j, i] = r_mat[:, j, i] - w
+
+        k_ex = torch.clamp(params[:, s_cnt], min=0.0)
+        v_rel = self.relative_volumes.to(dtype=state.dtype, device=state.device)
+        for i in range(n):
+            idx_0 = i
+            idx_1 = n + i
+            w_ex = k_ex * v_rel[i]
+            r_mat[:, idx_0, idx_0] = r_mat[:, idx_0, idx_0] + w_ex
+            r_mat[:, idx_1, idx_1] = r_mat[:, idx_1, idx_1] + w_ex
+            r_mat[:, idx_0, idx_1] = r_mat[:, idx_0, idx_1] - w_ex
+            r_mat[:, idx_1, idx_0] = r_mat[:, idx_1, idx_0] - w_ex
+
+        return r_mat
+
+    def _reaction_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        if not self._reaction_nodes:
+            return torch.zeros_like(state)
+        batch = state.shape[0]
+        c_fields = self.intensive_concentrations(state)  # [B, S, N]
+        v_rel = self.relative_volumes.to(dtype=state.dtype, device=state.device).view(1, self.num_nodes)
+        env: dict[str, torch.Tensor] = {
+            s_name: c_fields[:, s_idx, :]
+            for s_idx, s_name in enumerate(self.species_names)
+        }
+        base_p_offset = self.num_species + 1
+        for p_idx, p_spec in enumerate(self._reaction_param_specs):
+            env[p_spec.name] = params[:, base_p_offset + p_idx].unsqueeze(-1).expand(batch, self.num_nodes)
+
+        rxn_blocks: list[torch.Tensor] = []
+        for s_idx, node in enumerate(self._reaction_nodes):
+            rate_s = node.eval_tensor(env)
+            if rate_s.ndim == 0:
+                rate_s = rate_s.expand(batch, self.num_nodes)
+            rxn_blocks.append(rate_s * v_rel)
+        return torch.cat(rxn_blocks, dim=-1)
+
+    def external_drive_power(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        if not self._reaction_nodes:
+            return torch.zeros(state.shape[0], dtype=state.dtype, device=state.device)
+        e = self.effort(state, params)
+        rxn = self._reaction_flow(state, params)
+        return (e * rxn).sum(dim=-1)
+
+    def flow(
+        self,
+        state: torch.Tensor,
+        params: torch.Tensor,
+        port_inputs: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        base_f = super().flow(state, params, port_inputs=port_inputs)
+        if not self._reaction_nodes:
+            return base_f
+        return base_f + self._reaction_flow(state, params)
+
+
 @dataclass(frozen=True)
 class DiscretizedCompartmentGraph:
     """
@@ -408,6 +632,36 @@ class DiscretizedCompartmentGraph:
             edge_index=self.edge_index,
             edge_geometric_factors_m=self.edge_geometric_factors_m,
             diffusivity_default=diffusivity_default,
+            state_unit=state_unit,
+            time_unit=time_unit,
+        )
+
+    def to_multifield_reaction_diffusion_brick(
+        self,
+        name: str = "multifield_reaction_diffusion",
+        species_names: Sequence[str] = ("u", "v"),
+        diffusivities_default: Sequence[float] = (0.1, 1.0),
+        inter_species_exchange_default: float = 0.0,
+        reaction_exprs: Sequence[str] | None = None,
+        reaction_param_specs: Sequence[ParamSpec] = (),
+        state_unit: Unit = mM,
+        time_unit: Unit = s,
+    ) -> MultiFieldReactionDiffusionPDEBrick:
+        """
+        Compile this `DiscretizedCompartmentGraph` into a `MultiFieldReactionDiffusionPDEBrick`
+        modeling `S >= 2` interacting species across `N` spatial compartments with differential
+        diffusivities `D_s`, reversible Onsager exchange, and optional symbolic reaction kinetics.
+        """
+        return MultiFieldReactionDiffusionPDEBrick(
+            name=name,
+            volumes_m3=self.volumes_m3,
+            edge_index=self.edge_index,
+            edge_geometric_factors_m=self.edge_geometric_factors_m,
+            species_names=species_names,
+            diffusivities_default=diffusivities_default,
+            inter_species_exchange_default=inter_species_exchange_default,
+            reaction_exprs=reaction_exprs,
+            reaction_param_specs=reaction_param_specs,
             state_unit=state_unit,
             time_unit=time_unit,
         )

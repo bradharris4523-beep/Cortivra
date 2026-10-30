@@ -526,3 +526,51 @@ def test_surrogate_impulse_normalization_and_power_law_drag_dissipation() -> Non
     assert e_pts.grad is not None and torch.isfinite(e_pts.grad).all()
 
 
+def test_quantum_symplectic_lindblad_brick_and_unitary_born_norm_conservation() -> None:
+    """
+    Verify Horizon 3 (`QuantumSymplecticLindbladBrick` and `verify_quantum_unitary_norm_conservation`):
+        1. Unitary Rabi-Kerr evolution (`gamma = 0`) conserves both quantum Hamiltonian `H(q, p)`
+           and the Born probability norm `sum_k |psi_k|^2 = 0.5 * sum_k (q_k^2 + p_k^2)`.
+        2. Open-system Lindblad dephasing/relaxation (`gamma > 0`) satisfies `audit_law_brick`
+           and monotonically dissipates energy under the 2nd Law of Thermodynamics.
+    """
+    from cortivra.layer1_axioms import audit_law_brick, verify_quantum_unitary_norm_conservation
+    from cortivra.layer2_fabric import QuantumSymplecticLindbladBrick
+
+    q_brick = QuantumSymplecticLindbladBrick(
+        num_levels=3,
+        rabi_coupling_default=0.3,
+        lindblad_gamma_default=0.0,
+    )
+    x0 = q_brick.default_state(batch_size=2, dtype=torch.float64)
+    p_unitary = q_brick.default_params(batch_size=2, dtype=torch.float64)
+
+    norm_shield = verify_quantum_unitary_norm_conservation(q_brick, x0, p_unitary, tol=1e-12)
+    assert norm_shield.passed
+    assert audit_law_brick(q_brick, sample_state=x0, sample_params=p_unitary).passed_all
+
+    # Integrate unitary symplectic midpoint steps and verify exact Born norm + energy conservation
+    norm_0 = q_brick.born_norm(x0)
+    energy_0 = q_brick.hamiltonian_energy(x0, p_unitary)
+    x_curr = x0.clone()
+    for _ in range(25):
+        x_curr = q_brick.step_symplectic_midpoint(x_curr, p_unitary, dt=0.02)
+    norm_final = q_brick.born_norm(x_curr)
+    energy_final = q_brick.hamiltonian_energy(x_curr, p_unitary)
+    assert torch.allclose(norm_final, norm_0, atol=1e-9)
+    assert torch.allclose(energy_final, energy_0, atol=1e-8)
+
+    # Open-system Lindblad relaxation (gamma > 0)
+    q_open = QuantumSymplecticLindbladBrick(
+        num_levels=2,
+        rabi_coupling_default=0.25,
+        lindblad_gamma_default=0.15,
+    )
+    x_open = q_open.default_state(batch_size=2, dtype=torch.float64)
+    p_open = q_open.default_params(batch_size=2, dtype=torch.float64)
+    assert verify_quantum_unitary_norm_conservation(q_open, x_open, p_open, tol=1e-12).passed
+    assert audit_law_brick(q_open, sample_state=x_open, sample_params=p_open).passed_all
+    assert bool((q_open.dissipation_power(x_open, p_open) > 0.0).all().item())
+
+
+

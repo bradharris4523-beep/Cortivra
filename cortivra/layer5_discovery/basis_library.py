@@ -308,6 +308,45 @@ def generate_symbolic_basis_library(
                     )
                 )
 
+        # Off-diagonal Onsager dissipative cross-couplings (i, j) where R_cpl = gamma(x)*(u_i - u_j)*(u_i - u_j)^T >= 0
+        if state_dim >= 2:
+            for i in range(state_dim):
+                for j in range(i + 1, state_dim):
+                    if i not in target_indices and j not in target_indices:
+                        continue
+                    sp_i, sp_j = brick.state_specs[i], brick.state_specs[j]
+                    if sp_i.unit != sp_j.unit:
+                        continue
+                    e_diff = effort_traj[:, i] - effort_traj[:, j]
+                    if float(torch.linalg.norm(e_diff).item()) <= 1e-12:
+                        continue
+                    expected_rcpl_unit = (sp_i.unit * sp_j.unit) / (brick.energy_unit * brick.time_unit)
+                    p_name = f"g_onsager_{i}_{j}"
+                    p_spec = ParamSpec(
+                        name=p_name,
+                        unit=expected_rcpl_unit,
+                        default_value=0.1,
+                        min_value=0.0,
+                        max_value=1e6,
+                    )
+                    p_sym = SymbolNode(p_name, expected_rcpl_unit, role="param")
+                    flow_col = torch.zeros((t_steps, state_dim), dtype=torch.float64, device=x.device)
+                    flow_col[:, i] = -e_diff
+                    flow_col[:, j] = e_diff
+                    candidates.append(
+                        CandidateBasisTerm(
+                            term_id=f"onsager_{i}_{j}_const",
+                            expr_node=p_sym,
+                            param_spec=p_spec,
+                            extra_param_specs=(),
+                            thermodynamic_slot="passive_dissipative",
+                            target_key=(i, j),
+                            require_non_negative_coeff=True,
+                            complexity=1,
+                            flow_column=flow_col,
+                        )
+                    )
+
     # Slot 2: Hamiltonian potential (Delta_H(x), flow = (J - R) * grad(Delta_H))
     elif thermodynamic_slot == "hamiltonian_potential" and not brick.is_matrix_free:
         j_traj = brick.structure_matrix(x, p_batch).detach()
@@ -400,6 +439,26 @@ def generate_symbolic_basis_library(
                     )
                     inv_r_node = BinaryOpNode("/", ConstNode(1.0, DIMENSIONLESS), UnaryOpNode("sqrt", r2_node))
                     potential_shapes.append((f"H_inv_dist_{sym_i.name}_{sym_j.name}", inv_r_node, ()))
+
+        # 3D Euclidean SE(3) pairwise potentials when spatial_nodes_3d are declared on the brick
+        if len(brick.spatial_nodes_3d) >= 2:
+            sym_by_name = {sym.name: sym for sym in state_symbols}
+            for n_a in range(len(brick.spatial_nodes_3d)):
+                for n_b in range(n_a + 1, len(brick.spatial_nodes_3d)):
+                    node_a = brick.spatial_nodes_3d[n_a]
+                    node_b = brick.spatial_nodes_3d[n_b]
+                    if len(node_a.position_state_names) == 3 and len(node_b.position_state_names) == 3:
+                        sa_x, sa_y, sa_z = [sym_by_name[nm] for nm in node_a.position_state_names]
+                        sb_x, sb_y, sb_z = [sym_by_name[nm] for nm in node_b.position_state_names]
+                        dx_ab = BinaryOpNode("-", sa_x, sb_x)
+                        dy_ab = BinaryOpNode("-", sa_y, sb_y)
+                        dz_ab = BinaryOpNode("-", sa_z, sb_z)
+                        dist3d_ab = PrimitiveCallNode("dist3d", (dx_ab, dy_ab, dz_ab))
+                        inv_r1_ab = PrimitiveCallNode(
+                            "inv_dist_pow", (dx_ab, dy_ab, dz_ab, ConstNode(1.0, DIMENSIONLESS))
+                        )
+                        potential_shapes.append((f"H_dist3d_{node_a.node_id}_{node_b.node_id}", dist3d_ab, ()))
+                        potential_shapes.append((f"H_inv_r3d_{node_a.node_id}_{node_b.node_id}", inv_r1_ab, ()))
 
         for shape_tag, shape_node, extra_specs in potential_shapes:
             shape_u = shape_node.infer_unit()
@@ -534,6 +593,16 @@ def generate_symbolic_basis_library(
                         )
                     if sym_j.unit == sym_k.unit:
                         diff_jk = BinaryOpNode("-", sym_j, sym_k)
+                        drive_shapes.append(
+                            (
+                                f"flux_{sym_k.name}_{sym_j.name}",
+                                PrimitiveCallNode(
+                                    "diffusive_flux",
+                                    (sym_j, sym_k, ConstNode(1.0, DIMENSIONLESS)),
+                                ),
+                                (),
+                            )
+                        )
                         if max_polynomial_degree >= 3:
                             drive_shapes.append(
                                 (
@@ -597,6 +666,27 @@ def generate_symbolic_basis_library(
                         ),
                     )
                     drive_shapes.append((f"boltz_{sym_j.name}", boltz_node, (xh_spec, ks_spec)))
+
+            if len(brick.spatial_nodes_3d) >= 2:
+                sym_by_name = {sym.name: sym for sym in state_symbols}
+                for n_a in range(len(brick.spatial_nodes_3d)):
+                    for n_b in range(n_a + 1, len(brick.spatial_nodes_3d)):
+                        node_a = brick.spatial_nodes_3d[n_a]
+                        node_b = brick.spatial_nodes_3d[n_b]
+                        if len(node_a.position_state_names) == 3 and len(node_b.position_state_names) == 3:
+                            sa_x, sa_y, sa_z = [sym_by_name[nm] for nm in node_a.position_state_names]
+                            sb_x, sb_y, sb_z = [sym_by_name[nm] for nm in node_b.position_state_names]
+                            dx_ab = BinaryOpNode("-", sa_x, sb_x)
+                            dy_ab = BinaryOpNode("-", sa_y, sb_y)
+                            dz_ab = BinaryOpNode("-", sa_z, sb_z)
+                            inv_r3_ab = PrimitiveCallNode(
+                                "inv_dist_pow", (dx_ab, dy_ab, dz_ab, ConstNode(3.0, DIMENSIONLESS))
+                            )
+                            for axis_tag, diff_node in (("x", dx_ab), ("y", dy_ab), ("z", dz_ab)):
+                                force_comp = BinaryOpNode("*", diff_node, inv_r3_ab)
+                                drive_shapes.append(
+                                    (f"f3d_{axis_tag}_{node_a.node_id}_{node_b.node_id}", force_comp, ())
+                                )
 
             for shape_tag, shape_node, extra_specs in drive_shapes:
                 shape_u = shape_node.infer_unit()

@@ -331,7 +331,27 @@ def verify_thermodynamic_laws(
         p_ext = brick.external_patch_power(state, params)
     else:
         p_ext = torch.zeros_like(dh_dt)
-    power_balance_err = float(torch.max(torch.abs(dh_dt - (p_ext - dissipated))).item())
+
+    # Account for internal GENERIC 1st-Law thermal sink conversion if thermal state has non-zero effort
+    thermal_effort_term = torch.zeros_like(dh_dt)
+    generic_total_energy_err = 0.0
+    if getattr(brick, "thermal_sink_index", None) is not None:
+        t_idx = int(brick.thermal_sink_index)
+        t_scale = float(brick.thermal_capacity_scale)
+        f_th = brick.thermal_sink_flow(state, params)
+        thermal_effort_term = (e * f_th).sum(dim=-1)
+        # Verify GENERIC 1st-Law total energy conservation: d(H_work + E_thermal)/dt == P_ext
+        # Subtract any thermal effort contribution from dh_dt to isolate work-state dH_work/dt
+        dh_work_dt = dh_dt - e[:, t_idx] * dx_dt[:, t_idx]
+        de_thermal_dt = f_th[:, t_idx] / t_scale
+        generic_total_energy_err = float(
+            torch.max(torch.abs((dh_work_dt + de_thermal_dt) - p_ext)).item()
+        )
+
+    power_balance_err = max(
+        float(torch.max(torch.abs(dh_dt - (p_ext - dissipated + thermal_effort_term))).item()),
+        generic_total_energy_err,
+    )
 
     skew_err = 0.0
     sym_err = 0.0
@@ -428,6 +448,41 @@ def verify_detailed_balance_cycle(
         passed=passed,
         max_violation=max_err,
         tolerance=tol_j_per_mol,
+        message=msg,
+    )
+
+
+def verify_quantum_unitary_norm_conservation(
+    brick: LawBrick,
+    state: torch.Tensor,
+    params: torch.Tensor,
+    tol: float = 1e-6,
+) -> ShieldResult:
+    """
+    Verify that the conservative (unitary) symplectic flow `f_cons(q, p) = J(q, p) * grad_H(q, p)`
+    of a quantum quadrature system preserves the Born probability norm Casimir invariant:
+        `C(q, p) = 0.5 * sum_{k=0}^{N-1} (q_k^2 + p_k^2)`
+    such that `dC/dt|_unitary = grad_C(q, p) . f_cons(q, p) = x . f_cons(x) == 0` within `tol`.
+    """
+    if state.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"verify_quantum_unitary_norm_conservation requires an even symplectic state dimension 2N, "
+            f"got {state.shape[-1]}."
+        )
+    f_cons = brick.conservative_flow(state, params)
+    norm_drift_rate = (state * f_cons).sum(dim=-1)
+    max_viol = float(torch.max(torch.abs(norm_drift_rate)).item()) if norm_drift_rate.numel() > 0 else 0.0
+    passed = max_viol <= tol
+    msg = (
+        f"Quantum unitary Born-norm conservation passed (max |d/dt sum |psi_k|^2| = {max_viol:.3e})."
+        if passed
+        else f"Quantum unitary Born-norm violation: max |d/dt sum |psi_k|^2| = {max_viol:.3e} > tol {tol:.3e}."
+    )
+    return ShieldResult(
+        shield_name="quantum_unitary_norm_conservation",
+        passed=passed,
+        max_violation=max_viol,
+        tolerance=tol,
         message=msg,
     )
 
@@ -557,7 +612,9 @@ def analyze_unexplained_residual(
         x_d = state.to(torch.float64)
         ones = torch.ones((batch_size, 1), dtype=torch.float64, device=state.device)
         basis_cols = [ones, x_d, x_d**2]
-        if 1 < state_dim <= 8 and batch_size > (1 + 2 * state_dim + (state_dim * (state_dim - 1)) // 2 + 2):
+        if batch_size > (1 + 3 * state_dim + 4):
+            basis_cols.append(x_d**3)
+        if 1 < state_dim <= 8 and batch_size > (len(basis_cols) * state_dim + (state_dim * (state_dim - 1)) // 2 + 2):
             cross_terms = [
                 (x_d[:, i] * x_d[:, j]).unsqueeze(-1)
                 for i in range(state_dim)
@@ -569,7 +626,7 @@ def analyze_unexplained_residual(
             design,
             operator_name=f"ResidualCoherenceBasis({brick.name})",
         )
-        r2_scores: list[float] = []
+        r2_by_idx: dict[int, float] = {}
         for idx in target_indices:
             y = residual_flow[:, idx].to(torch.float64)
             ss_tot = torch.sum((y - torch.mean(y)) ** 2)
@@ -579,9 +636,14 @@ def analyze_unexplained_residual(
             y_hat = (design @ sol).squeeze(-1)
             ss_res = torch.sum((y - y_hat) ** 2)
             r2 = max(0.0, float((1.0 - ss_res / torch.clamp(ss_tot, min=1e-18)).item()))
-            r2_scores.append(r2)
-        if r2_scores:
-            coherence_r2 = float(sum(r2_scores) / len(r2_scores))
+            r2_by_idx[idx] = r2
+        if r2_by_idx:
+            coherent_sub = tuple(idx for idx in affected_indices if r2_by_idx.get(idx, 0.0) >= min_coherence_r2)
+            if coherent_sub:
+                affected_indices = coherent_sub
+                coherence_r2 = float(sum(r2_by_idx[i] for i in coherent_sub) / len(coherent_sub))
+            else:
+                coherence_r2 = float(sum(r2_by_idx.values()) / len(r2_by_idx))
 
     # Classify thermodynamic signature of the residual power DeltaP = grad_H . Phi
     max_p = float(torch.max(missing_power).item()) if missing_power.numel() > 0 else 0.0

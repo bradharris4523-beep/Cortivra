@@ -85,28 +85,110 @@ class ParetoDiscoveryReport:
     best_candidate: SymbolicCandidate | None
 
 
+def build_variational_bump_integral_system(
+    flow_columns: torch.Tensor,
+    target_residual: torch.Tensor,
+    dt: float = 0.01,
+    window_steps: int = 8,
+    bump_degree: int = 4,
+    num_experiments: int = 1,
+    states: torch.Tensor | None = None,
+    base_flow: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Construct a pure Weak-Form Variational Integral linear system `(G_weak, b_weak)` using
+    compactly supported `C^p` bump test functions `phi(tau) = (1 - tau^2)^p` on `tau in [-1, 1]`.
+
+    When `states` (`[E*T, StateDim]`) is provided, uses exact integration by parts:
+        `integral phi(t) * (dx/dt - F_base(x)) dt = -integral (dphi/dt) * x(t) dt - integral phi(t) * F_base(x) dt`
+    so the noisy state trajectory `x(t)` is NEVER differentiated!
+    Respects `num_experiments` boundaries so windows never cross between distinct experiments.
+    """
+    total_pts, state_dim, num_terms = flow_columns.shape
+    n_exp = max(int(num_experiments), 1)
+    t_per_exp = total_pts // n_exp
+    w = min(max(int(window_steps), 4), max(t_per_exp - 1, 1))
+    if t_per_exp < w + 1 or w < 2:
+        return (
+            flow_columns.reshape(total_pts * state_dim, num_terms),
+            target_residual.reshape(total_pts * state_dim),
+        )
+
+    p_deg = max(int(bump_degree), 2)
+    tau = torch.linspace(-1.0, 1.0, w + 1, dtype=flow_columns.dtype, device=flow_columns.device)
+    one_minus_tau2 = torch.clamp(1.0 - tau * tau, min=0.0)
+    phi = one_minus_tau2 ** float(p_deg)  # [w+1], vanishes at endpoints tau = -1, +1
+    half_len = 0.5 * float(w) * dt
+    # Analytical time derivative dphi/dt = (dphi/dtau) * (dtau/dt)
+    dphi_dt = (-2.0 * float(p_deg) * tau * (one_minus_tau2 ** float(p_deg - 1))) / max(half_len, 1e-12)
+
+    trap_w = torch.ones((w + 1,), dtype=flow_columns.dtype, device=flow_columns.device)
+    trap_w[0] = 0.5
+    trap_w[-1] = 0.5
+    norm_factor = max(float(torch.sum(trap_w * phi).item()), 1e-12)
+    quad_phi = (trap_w * phi) / norm_factor
+    quad_dphi = (trap_w * dphi_dt) / norm_factor
+
+    g_rows: list[torch.Tensor] = []
+    b_rows: list[torch.Tensor] = []
+    stride = max(w // 4, 1)
+
+    for exp_i in range(n_exp):
+        base_offset = exp_i * t_per_exp
+        for local_start in range(0, t_per_exp - w, stride):
+            start = base_offset + local_start
+            end = start + w + 1
+            win_cols = torch.einsum("w,wsm->sm", quad_phi, flow_columns[start:end])
+            if states is not None:
+                x_win = states[start:end].to(flow_columns.dtype)
+                # Integration by parts: -integral (dphi/dt) * x(t) dt
+                rhs_ibp = -torch.einsum("w,ws->s", quad_dphi, x_win)
+                if base_flow is not None:
+                    f_win = base_flow[start:end].to(flow_columns.dtype)
+                    rhs_ibp = rhs_ibp - torch.einsum("w,ws->s", quad_phi, f_win)
+                win_targ = rhs_ibp
+            else:
+                win_targ = torch.einsum("w,ws->s", quad_phi, target_residual[start:end])
+            g_rows.append(win_cols)
+            b_rows.append(win_targ)
+
+    if not g_rows:
+        return (
+            flow_columns.reshape(total_pts * state_dim, num_terms),
+            target_residual.reshape(total_pts * state_dim),
+        )
+    return torch.cat(g_rows, dim=0), torch.cat(b_rows, dim=0)
+
+
 def build_weak_integral_system(
     flow_columns: torch.Tensor,
     target_residual: torch.Tensor,
     dt: float = 0.01,
     window_steps: int = 4,
     integral_weight: float = 0.5,
+    num_experiments: int = 1,
+    states: torch.Tensor | None = None,
+    base_flow: torch.Tensor | None = None,
+    variational_bump_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Construct a combined pointwise and weak-integral linear system `(A, b)` from
-    `flow_columns` (`[T, StateDim, NumTerms]`) and `target_residual` (`[T, StateDim]`).
+    Construct a combined pointwise, trapezoidal weak-integral, and variational bump-test
+    linear system `(A, b)` from `flow_columns` (`[E*T, StateDim, NumTerms]`) and
+    `target_residual` (`[E*T, StateDim]`).
 
-    Integrating over sliding windows `[t_k, t_{k+w}]` via the trapezoidal rule filters out
-    high-frequency derivative estimation noise while preserving exact linear coefficients.
+    Respects `num_experiments` boundaries so sliding integral windows never cross between
+    distinct trajectory experiments `[e * T, (e + 1) * T)`.
     """
-    t_steps, state_dim, num_terms = flow_columns.shape
-    a_pt = flow_columns.reshape(t_steps * state_dim, num_terms)
-    b_pt = target_residual.reshape(t_steps * state_dim)
+    total_pts, state_dim, num_terms = flow_columns.shape
+    a_pt = flow_columns.reshape(total_pts * state_dim, num_terms)
+    b_pt = target_residual.reshape(total_pts * state_dim)
 
-    if t_steps < window_steps + 2 or integral_weight <= 0.0 or window_steps < 2:
+    n_exp = max(int(num_experiments), 1)
+    t_per_exp = total_pts // n_exp
+
+    if t_per_exp < window_steps + 2 or integral_weight <= 0.0 or window_steps < 2:
         return a_pt, b_pt
 
-    num_windows = t_steps - window_steps
     int_a_rows: list[torch.Tensor] = []
     int_b_rows: list[torch.Tensor] = []
 
@@ -116,17 +198,36 @@ def build_weak_integral_system(
     trap_w[-1] = 0.5
     trap_w = trap_w / float(window_steps)
 
-    for start in range(num_windows):
-        end = start + window_steps + 1
-        win_cols = torch.einsum("w,wsm->sm", trap_w, flow_columns[start:end])
-        win_targ = torch.einsum("w,ws->s", trap_w, target_residual[start:end])
-        int_a_rows.append(win_cols)
-        int_b_rows.append(win_targ)
+    for exp_i in range(n_exp):
+        base_offset = exp_i * t_per_exp
+        for local_start in range(t_per_exp - window_steps):
+            start = base_offset + local_start
+            end = start + window_steps + 1
+            win_cols = torch.einsum("w,wsm->sm", trap_w, flow_columns[start:end])
+            win_targ = torch.einsum("w,ws->s", trap_w, target_residual[start:end])
+            int_a_rows.append(win_cols)
+            int_b_rows.append(win_targ)
 
     a_int = torch.cat(int_a_rows, dim=0) * integral_weight
     b_int = torch.cat(int_b_rows, dim=0) * integral_weight
+    a_out = torch.cat([a_pt, a_int], dim=0)
+    b_out = torch.cat([b_pt, b_int], dim=0)
 
-    return torch.cat([a_pt, a_int], dim=0), torch.cat([b_pt, b_int], dim=0)
+    if variational_bump_weight > 0.0 and t_per_exp >= 7:
+        g_var, b_var = build_variational_bump_integral_system(
+            flow_columns=flow_columns,
+            target_residual=target_residual,
+            dt=dt,
+            window_steps=min(max(window_steps * 2, 6), t_per_exp - 1),
+            bump_degree=4,
+            num_experiments=n_exp,
+            states=states,
+            base_flow=base_flow,
+        )
+        a_out = torch.cat([a_out, g_var * variational_bump_weight], dim=0)
+        b_out = torch.cat([b_out, b_var * variational_bump_weight], dim=0)
+
+    return a_out, b_out
 
 
 def _solve_subspace_coefficients(
@@ -584,13 +685,18 @@ def solve_sparse_pareto_front(
     window_steps: int = 4,
     integral_weight: float = 0.5,
     extra_candidates: Sequence[SymbolicCandidate] = (),
+    num_experiments: int = 1,
+    states: torch.Tensor | None = None,
+    base_flow: torch.Tensor | None = None,
+    variational_bump_weight: float = 0.0,
 ) -> ParetoDiscoveryReport:
     """
     Discover the Pareto front of sparse symbolic equations from `library` that explain
-    `target_residual` (`[T, StateDim]`).
+    `target_residual` (`[E*T, StateDim]`).
 
     Combines:
-        1. Dual pointwise + weak integral collocation system construction.
+        1. Dual pointwise + weak integral + C^4 variational bump collocation system construction
+           with multi-experiment boundary protection (`num_experiments`).
         2. Unit-column-normalized Orthogonal Matching Pursuit (OMP) for cardinalities `1..max_active_terms`.
         3. Unit-column-normalized Sequential Thresholded Ridge Regression (STRidge) across a geometric
            grid of sparsity thresholds.
@@ -615,6 +721,10 @@ def solve_sparse_pareto_front(
             dt=dt,
             window_steps=window_steps,
             integral_weight=integral_weight,
+            num_experiments=num_experiments,
+            states=states,
+            base_flow=base_flow,
+            variational_bump_weight=variational_bump_weight,
         )
 
         # Normalize columns to unit L2 norm for scale-invariant threshold & greedy selection
@@ -769,7 +879,7 @@ def solve_sparse_pareto_front(
                     if c_idx is not None and c_idx not in sub_list and c_idx not in debias_indices:
                         debias_indices.append(c_idx)
 
-            if debias_indices:
+            if debias_indices and variational_bump_weight <= 0.0:
                 aug_list = sub_list + debias_indices
                 aug_non_neg = non_neg_all[aug_list].clone()
                 # Allow the linear baseline shift to be unconstrained so it removes base-parameter bias
@@ -1015,6 +1125,8 @@ def discover_conservation_invariants(
     if flows is not None:
         dx_in = flows.detach().to(torch.float64)
         dx = dx_in.reshape(-1, state_dim) if dx_in.ndim == 3 else dx_in
+        x_lie = x
+        dx_lie = dx
     else:
         p = (
             params.detach().to(torch.float64)
@@ -1023,11 +1135,38 @@ def discover_conservation_invariants(
         )
         if p.ndim == 1:
             p = p.unsqueeze(0)
-        p_batch = p.expand(total_pts, -1) if p.shape[0] == 1 else p
+        p_single = p[:1]
+        p_batch = p_single.expand(total_pts, -1) if p.shape[0] == 1 else p
         dx = brick.flow(x, p_batch).detach().to(torch.float64)
 
+        # Augment Lie-derivative operator evaluation with orthogonal phase-space perturbations
+        # around the trajectory so single-curve parameterizations on dissipative attractors
+        # are distinguished from true phase-space first integrals (grad I(x) . f(x) == 0).
+        if state_dim >= 2 and total_pts >= 4 and float(torch.linalg.norm(dx).item()) > 1e-9:
+            anchor_indices = [0, total_pts // 3, (2 * total_pts) // 3, total_pts - 1]
+            anchors = x[anchor_indices]  # [4, D]
+            coord_stds = torch.clamp(torch.std(x, dim=0), min=0.08)
+            probe_rows: list[torch.Tensor] = []
+            for d_i in range(state_dim):
+                for sign in (-0.35, 0.35):
+                    pert = anchors.clone()
+                    pert[:, d_i] = pert[:, d_i] + sign * coord_stds[d_i]
+                    if bool((x[:, d_i] > 1e-3).all().item()):
+                        min_pos = float(torch.min(x[:, d_i]).item()) * 0.25
+                        pert[:, d_i] = torch.clamp(pert[:, d_i], min=max(min_pos, 1e-3))
+                    probe_rows.append(brick.clamp_to_hard_bounds(pert))
+            x_probe = torch.cat(probe_rows, dim=0)
+            x_lie = torch.cat([x, x_probe], dim=0)
+            p_lie = p_single.expand(x_lie.shape[0], -1)
+            dx_lie = brick.flow(x_lie, p_lie).detach().to(torch.float64)
+        else:
+            x_lie = x
+            dx_lie = dx
+
+    lie_pts = int(x_lie.shape[0])
     state_symbols = [SymbolNode(sp.name, sp.unit, role="state") for sp in brick.state_specs]
     env = {sp.name: x[:, i] for i, sp in enumerate(brick.state_specs)}
+    env_lie = {sp.name: x_lie[:, i] for i, sp in enumerate(brick.state_specs)}
 
     def _build_subspace_nodes(
         sub_max_deg: int,
@@ -1106,12 +1245,12 @@ def discover_conservation_invariants(
             if std_v <= 1e-6 or not torch.isfinite(vals).all():
                 continue
 
-            grad_cols = [node.diff(sp.name).simplify().eval_tensor(env) for sp in brick.state_specs]
-            grad_mat = torch.stack(grad_cols, dim=-1)  # [N, D]
+            grad_cols = [node.diff(sp.name).simplify().eval_tensor(env_lie) for sp in brick.state_specs]
+            grad_mat = torch.stack(grad_cols, dim=-1)  # [N_lie, D]
             g_norm = float(torch.linalg.norm(grad_mat).item())
-            if g_norm <= 1e-9:
+            if g_norm <= 1e-9 or not torch.isfinite(grad_mat).all():
                 continue
-            lie_deriv = torch.sum(grad_mat * dx, dim=-1)  # [N]
+            lie_deriv = torch.sum(grad_mat * dx_lie, dim=-1)  # [N_lie]
 
             kept_labels.append(label)
             kept_nodes.append(node)
@@ -1124,14 +1263,14 @@ def discover_conservation_invariants(
         if not lie_cols:
             continue
 
-        l_mat = torch.stack(lie_cols, dim=-1)  # [N, M]
+        l_mat = torch.stack(lie_cols, dim=-1)  # [N_lie, M]
         val_mat = torch.stack(val_cols, dim=-1)  # [N, M]
-        grad_tensor = torch.stack(grad_mats, dim=-1)  # [N, D, M]
+        grad_tensor = torch.stack(grad_mats, dim=-1)  # [N_lie, D, M]
         grad_norm_vec = torch.tensor(grad_norms, dtype=torch.float64, device=x.device)
         std_vec = torch.tensor(std_scales, dtype=torch.float64, device=x.device)
 
         _, s_vals, vh = torch.linalg.svd(l_mat, full_matrices=False)
-        s_norm = s_vals / math.sqrt(max(total_pts, 1))
+        s_norm = s_vals / math.sqrt(max(lie_pts, 1))
         last_s_norm = tuple(float(v) for v in s_norm.tolist())
         null_mask = s_norm <= nullspace_tol
         null_count = int(torch.sum(null_mask).item())
