@@ -669,14 +669,14 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
 
             <div class="kpi-grid" id="overviewKpis"></div>
 
-            <!-- Dropdown 1.1: Plain-English Discovery & Safety Brief (Open by default) -->
+            <!-- Dropdown 1.1: Executive Synthesis & Safety Brief (Open by default) -->
             <details class="dossier-dropdown" open>
               <summary class="dropdown-header">
                 <div class="dropdown-title-group">
                   <span class="dropdown-chevron">&#9654;</span>
                   <div class="dropdown-title-text">
-                    <span class="dropdown-main-title">1A. What the Engine Discovered &amp; How It Prevents Side Effects</span>
-                    <span class="dropdown-sub-caption">Plain-English summary of the problem solved, how much the target improved, and how healthy parts stayed safe</span>
+                    <span class="dropdown-main-title">1A. Executive Synthesis, Target Trajectory &amp; SVD Bystander Shield</span>
+                    <span class="dropdown-sub-caption">Live Meta Muse synthesis, target loss reduction, protected bystander states, and solved parameter deltas</span>
                   </div>
                 </div>
                 <div class="dropdown-right-controls">
@@ -695,8 +695,8 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 <div class="dropdown-title-group">
                   <span class="dropdown-chevron">&#9654;</span>
                   <div class="dropdown-title-text">
-                    <span class="dropdown-main-title">1B. How the Solution Works Across All 3 Stages (Physics &rarr; Lab Recipe &rarr; Molecule &amp; 3D Structure)</span>
-                    <span class="dropdown-sub-caption">Stage 1 finds which levers to tune &middot; Stage 2 solves the lab manufacturing recipe &middot; Stage 3 designs the molecule &amp; 3D lattice</span>
+                    <span class="dropdown-main-title">1B. 3-Stage Physical Compilation Summary (Actuators &rarr; Reactor &rarr; Molecule &amp; Lattice)</span>
+                    <span class="dropdown-sub-caption">Stage 1 Eyring actuator factorization &middot; Stage 2 4-stage reactor yield &middot; Stage 3 SMILES &amp; 3D lattice &middot; Blind 30%&rarr;70% R&sup2;</span>
                   </div>
                 </div>
                 <div class="dropdown-right-controls">
@@ -705,7 +705,6 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 </div>
               </summary>
               <div class="dropdown-body">
-                <div class="plain-english-callout" id="callout1B"></div>
                 <div class="summary-card-grid" id="pass1Pass2ExecutiveGrid"></div>
               </div>
             </details>
@@ -716,8 +715,8 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 <div class="dropdown-title-group">
                   <span class="dropdown-chevron">&#9654;</span>
                   <div class="dropdown-title-text">
-                    <span class="dropdown-main-title">1C. 5-Point Proof Scorecard: Why Standard Approaches Fail vs. How Cortivra Succeeded</span>
-                    <span class="dropdown-sub-caption">Side-by-side comparison against standard curve-fitting and single-lever fixes</span>
+                    <span class="dropdown-main-title">1C. 5-Point Causal Proof Scorecard: Classical Baseline vs. Discovered Mechanism</span>
+                    <span class="dropdown-sub-caption">Quantitative comparison against textbook linear relaxation, polynomial fits, and unshielded single-lever control</span>
                   </div>
                 </div>
                 <div class="dropdown-right-controls">
@@ -726,15 +725,14 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 </div>
               </summary>
               <div class="dropdown-body">
-                <div class="plain-english-callout" id="callout1C"></div>
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Test Performed</th>
-                      <th>What Question Was Tested?</th>
-                      <th>Why Standard / Naive Approach Fails</th>
-                      <th>What Cortivra Found &amp; Proved (In Plain Terms)</th>
-                      <th>Result</th>
+                      <th>Verification Check</th>
+                      <th>Scientific Question Tested</th>
+                      <th>Classical / Naive Baseline Result</th>
+                      <th>Cortivra Discovered Mechanism &amp; Verified Result</th>
+                      <th>Status</th>
                     </tr>
                   </thead>
                   <tbody id="discoveryProofTableBody"></tbody>
@@ -748,8 +746,8 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 <div class="dropdown-title-group">
                   <span class="dropdown-chevron">&#9654;</span>
                   <div class="dropdown-title-text">
-                    <span class="dropdown-main-title">1D. Real-World Scientific Papers &amp; Lab BioAssays Pulled Live (`OpenAlex`, `EuropePMC`, `arXiv`, `ChEMBL`)</span>
-                    <span class="dropdown-sub-caption">Published papers, DOIs, and real experimental binding/rate numbers used to ground the model</span>
+                    <span class="dropdown-main-title">1D. 4-Registry Open-Science Literature &amp; BioAssay Grounding (`OpenAlex`, `EuropePMC`, `arXiv`, `ChEMBL`)</span>
+                    <span class="dropdown-sub-caption">Peer-reviewed publications, DOIs, and extracted quantitative empirical constants</span>
                   </div>
                 </div>
                 <div class="dropdown-right-controls">
@@ -758,16 +756,15 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 </div>
               </summary>
               <div class="dropdown-body">
-                <div class="plain-english-callout" id="callout1D"></div>
                 <div id="literatureConstantsBox" style="margin-bottom:10px;"></div>
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Database &amp; Year</th>
-                      <th>Published Paper or Wet-Lab BioAssay</th>
-                      <th>Clickable Link / DOI</th>
-                      <th>Match Score</th>
-                      <th>Real Lab Numbers Pulled &amp; What They Mean</th>
+                      <th>Registry &amp; Year</th>
+                      <th>Publication or BioAssay Title</th>
+                      <th>DOI / Identifier</th>
+                      <th>Relevance</th>
+                      <th>Extracted Quantitative Constants</th>
                     </tr>
                   </thead>
                   <tbody id="literatureTableBody"></tbody>
@@ -781,8 +778,8 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 <div class="dropdown-title-group">
                   <span class="dropdown-chevron">&#9654;</span>
                   <div class="dropdown-title-text">
-                    <span class="dropdown-main-title">1E. Competing Ideas Tested: Why Other Strategies Were Rejected</span>
-                    <span class="dropdown-sub-caption">Every candidate strategy tested against 6 safety and stability rules</span>
+                    <span class="dropdown-main-title">1E. 6-Rule Multi-Hypothesis Physical Elimination Crucible</span>
+                    <span class="dropdown-sub-caption">All competing control and operator hypotheses audited against 6 physical falsification rules</span>
                   </div>
                 </div>
                 <div class="dropdown-right-controls">
@@ -791,16 +788,15 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 </div>
               </summary>
               <div class="dropdown-body">
-                <div class="plain-english-callout" id="callout1E"></div>
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Candidate Strategy</th>
-                      <th>Verdict</th>
-                      <th>Remaining Target Error</th>
-                      <th>Side-Effect Spillover</th>
-                      <th>Long-Term Stability</th>
-                      <th>Plain-English Reason It Passed or Failed</th>
+                      <th>Candidate Hypothesis</th>
+                      <th>Crucible Verdict</th>
+                      <th>Target Loss</th>
+                      <th>Max Collateral Drift</th>
+                      <th>4&times; Horizon Viability</th>
+                      <th>Physical Rules Broken</th>
                     </tr>
                   </thead>
                   <tbody id="tournamentTableBody"></tbody>
@@ -814,24 +810,23 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 <div class="dropdown-title-group">
                   <span class="dropdown-chevron">&#9654;</span>
                   <div class="dropdown-title-text">
-                    <span class="dropdown-main-title">1F. Self-Improving Question Chain: How the Engine Refined Its Own Equations</span>
-                    <span class="dropdown-sub-caption">3 rounds of automatic follow-up questions that improved future prediction accuracy</span>
+                    <span class="dropdown-main-title">1F. 3-Generation Autonomous Curiosity &amp; Residual Discovery Chain</span>
+                    <span class="dropdown-sub-caption">Progression from Gen-1 textbook baseline to Gen-2 residual operator discovery and Gen-3 cross-observatory fusion</span>
                   </div>
                 </div>
                 <div class="dropdown-right-controls">
-                  <span class="badge badge-pass" id="badge1F">3 ROUNDS</span>
+                  <span class="badge badge-pass" id="badge1F">3 GENERATIONS</span>
                   <button type="button" class="ask-ai-pill" onclick="event.stopPropagation(); window.askAiAboutSection('1F. 3-Generation Self-Improving Question Chain', 'curiosityChainTableBody')">&#128172; Ask AI</button>
                 </div>
               </summary>
               <div class="dropdown-body">
-                <div class="plain-english-callout" id="callout1F"></div>
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Round</th>
-                      <th>Follow-Up Question the Engine Asked Itself</th>
-                      <th>Where It Looked</th>
-                      <th>Prediction Accuracy &amp; What Improved</th>
+                      <th>Generation</th>
+                      <th>Autonomous Scientific Probe Question</th>
+                      <th>Phase-Space Probe Coordinate</th>
+                      <th>Blind 70% Future R&sup2; (&Delta;R&sup2;)</th>
                     </tr>
                   </thead>
                   <tbody id="curiosityChainTableBody"></tbody>
@@ -846,8 +841,8 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 <div class="dropdown-title-group">
                   <span class="dropdown-chevron">&#9654;</span>
                   <div class="dropdown-title-text">
-                    <span class="dropdown-main-title">1G. Step-by-Step Scientific Council Decision Log</span>
-                    <span class="dropdown-sub-caption">Why each mathematical tool was chosen in sequence and what it found</span>
+                    <span class="dropdown-main-title">1G. Multi-Agent Epistemic Council Execution Trajectory</span>
+                    <span class="dropdown-sub-caption">Chronological operator invocations, epistemic rationale, and execution summaries</span>
                   </div>
                 </div>
                 <div class="dropdown-right-controls">
@@ -856,14 +851,13 @@ _WORKBENCH_HTML = r"""<!DOCTYPE html>
                 </div>
               </summary>
               <div class="dropdown-body">
-                <div class="plain-english-callout" id="callout1G"></div>
                 <table class="data-table">
                   <thead>
                     <tr>
                       <th>Step</th>
                       <th>Agent Role</th>
-                      <th>Action Taken</th>
-                      <th>Plain-English Reason &amp; Result</th>
+                      <th>Operator Invoked</th>
+                      <th>Epistemic Rationale &amp; Execution Summary</th>
                     </tr>
                   </thead>
                   <tbody id="councilStepsTableBody"></tbody>

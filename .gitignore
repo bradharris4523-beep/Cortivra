@@ -1,20 +1,41 @@
-# Credentials and environment variables
+# ==============================================================================
+# CORTIVRA — STRICT SECURITY & ARTIFACT EXCLUSION POLICY
+# ==============================================================================
+
+# 1. Credentials, API keys, and environment variables (NEVER COMMIT)
 .env
 .env.*
+*.env
 !.env.example
 *.key
 *.pem
 *.crt
+*.p12
+*.pfx
+*.jks
+*.secret
+*.secrets
 secrets/
 credentials.json
+*credentials*.json
+*token*.json
 
-# Local discovery vaults and scratch data
+# 2. Local discovery vaults, run logs, and proprietary scratch data
 private_vault/
+vault_showcase/
 *.vault.private
 *.proprietary.*
 scratch_experiments/
+runs/
+logs/
+wandb/
+outputs/
+tmp/
+temp/
+*.log
+*.jsonl
 
-# Python bytecode and virtual environments
+# 3. Python bytecode, packaging, and virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
@@ -40,7 +61,7 @@ venv/
 ENV/
 env/
 
-# Test and linter caches
+# 4. Test, coverage, and linter caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -49,7 +70,7 @@ env/
 htmlcov/
 coverage.xml
 
-# Checkpoints and temporary traces
+# 5. Model weights, checkpoints, and large media recordings
 *.pt
 *.pth
 *.onnx
@@ -58,31 +79,32 @@ coverage.xml
 *.h5
 *.hdf5
 *.npz
+*.mp4
+*.mov
+*.mkv
+*.avi
 wasm_cache/
-runs/
-logs/
-wandb/
-outputs/
-tmp/
-temp/
 
-# Frontend build artifacts
+# 6. Frontend build artifacts
 node_modules/
 observatory_ui/node_modules/
 observatory_ui/dist/
 observatory_ui/.vite/
-*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# OS and editor files
+# 7. OS, IDE, and AI assistant metadata
 .DS_Store
 Thumbs.db
 Desktop.ini
 .vscode/
 .idea/
+.cursor/
+.claude/
+.gemini/
+.antigravity/
 *.swp
 *.swo
 *~
