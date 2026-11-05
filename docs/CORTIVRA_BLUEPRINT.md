@@ -1,77 +1,31 @@
-# Cortivra Architecture Notes
+# Cortivra Mathematical & Architectural Reference
 
 ## Overview
 
-Cortivra is a 7-layer differentiable physics and biophysics simulation engine. It connects mathematical operators across thermodynamics, chemistry, cellular electrophysiology, spatial morphology, and network dynamics into a single batched PyTorch tensor pipeline.
-
-Rather than hardcoding domain-specific outcomes, the engine enforces dimensional homogeneity, conservation of mass and charge, and port-Hamiltonian energy balance at the lowest layer (`layer1_axioms`). Higher layers assemble equations from 12 reusable differential operators (`layer2_fabric`), compile them into batched GPU kernels (`layer3_compiler`), filter candidate parameter spaces through a 4-stage elimination and inverse-gradient solver (`layer4_engine`), and stress-test surviving solutions against thermal noise and parameter perturbation (`layer5_proof`). Meta AI models (`Muse Wonder`, `Muse Spark`, `Muse Spark Open`, `Muse Glimmer`, and `SAM 3.1` in `layer6_agents`) formulate hypotheses, steer the simulation loop, and stream telemetry to the web UI (`layer7_observatory`).
+Cortivra is a 6-layer differentiable physics discovery, verification, and inverse design engine with full-stack causal observability. Rather than relying on domain-specific lookup tables or unconstrained black-box curve fitting, Cortivra enforces 7D SI dimensional homogeneity, conservation laws, Port-Hamiltonian energy balance, and GKSL open quantum master positivity at the lowest layer (`layer1_axioms`).
 
 ---
 
-## Core Physical Principles
+## Core Mathematical Foundations
 
-Every subsystem in Cortivra is represented through four physical components:
+1. **Port-Hamiltonian & Metriplectic Dynamics (`layer1_axioms`):**
+   $$\frac{d\mathbf{x}}{dt} = \bigl(J(\mathbf{x}) - R(\mathbf{x})\bigr)\nabla H(\mathbf{x}) + \Phi(\mathbf{x}, \mathbf{u})$$
+   where $H(\mathbf{x})$ is the total stored energy, $J(\mathbf{x}) = -J(\mathbf{x})^\top$ is the skew-symmetric conservative Poisson interconnection tensor, $R(\mathbf{x}) = R(\mathbf{x})^\top \succeq 0$ is the symmetric positive semi-definite Onsager dissipation tensor ($\dot{S} \ge 0$), and $\Phi(\mathbf{x}, \mathbf{u})$ represents external ports or control drives.
 
-1. **Conservation and Thermodynamics:**
-   Subsystems follow open port-Hamiltonian dynamics:
-   $$\frac{dx}{dt} = (J(x) - R(x))\nabla H(x) + B(x)u$$
-   where $H(x)$ is stored energy, $J(x) = -J(x)^T$ is conservative routing, $R(x) = R(x)^T \succeq 0$ is entropy/heat dissipation, and ports satisfy $\text{Dim}(\text{Effort} \times \text{Flow}) = \text{Watts}$.
-2. **Constitutive and Kinetic Laws:**
-   Transition rates and binding equilibria follow Arrhenius/Eyring barrier crossing, Boltzmann gating, mass-action stoichiometry, Hill cooperativity, and multi-state Markov graphs.
-3. **Spatial Geometry and Graph Topology:**
-   Continuous diffusion and multi-compartment cable equations parameterized from segmented morphology (`SAM 3.1`), paired with directed graph connectivity and axonal delays.
-4. **Multi-Timescale Control:**
-   Fast-slow coupling across microseconds (ion channels), milliseconds (spikes), seconds (calcium and ATP metabolism), and minutes/hours (homeostatic integral feedback and plasticity).
+2. **GKSL / Lindblad Quantum Master & Wave-Coherence Positivity (`layer1_axioms/shields.py`):**
+   $$\frac{d\hat{\rho}}{dt} = -\frac{i}{\hbar}[\hat{H}, \hat{\rho}] + \sum_k \gamma_k \left(\hat{L}_k \hat{\rho} \hat{L}_k^\dagger - \frac{1}{2}\{\hat{L}_k^\dagger \hat{L}_k, \hat{\rho}\}\right)$$
+   Enforces complete positivity and trace preservation ($\lambda_{\min}(R_{\text{sym}}) \ge 0$) and the universal quantum decoherence bound $T_2 \le 2 T_1$.
 
----
+3. **SVD Nullspace Bystander Shield (`layer4_engine/inverse_solver.py`):**
+   Projects parameter updates $\Delta\boldsymbol{\theta}$ onto the orthogonal complement of the bystander Jacobian $J_{\text{byst}}$:
+   $$\Delta\boldsymbol{\theta}_{\perp} = \bigl(I - V_{\text{byst}} V_{\text{byst}}^\top\bigr)\Delta\boldsymbol{\theta}$$
+   guaranteeing zero first-order collateral drift on protected bystander states.
 
-## The 12 Differential Primitives (`layer2_fabric`)
+4. **Implicit SINDy-PI Symbolic Regression & Helmholtz-Hodge Decomposition (`layer5_discovery`):**
+   Recovers polynomial, rational Padé ($\frac{P(\mathbf{x})}{1 + Q(\mathbf{x})}$), fractional power-law ($x^\gamma$), logarithmic ($\ln(1+x)$), and spatial Laplacian PDE operators directly from trajectory data, while decomposing the vector field into divergence-free symplectic flow and curl-free dissipative gradient flow.
 
-1. `ConservationFlux` — Mass and charge continuity across coupled ports.
-2. `NernstPlanckDrift` — Electrochemical equilibrium and electrodiffusion ($\frac{RT}{zF}\ln\frac{c_{\text{out}}}{c_{\text{in}}}$).
-3. `CapacitiveRC` — Dielectric charge storage and membrane potential integration ($C\frac{dV}{dt} = \sum I$).
-4. `BoltzmannBarrier` — Equilibrium activation/inactivation curves ($\frac{1}{1 + \exp((V_{1/2} - V)/k)}$).
-5. `EyringTransitionRate` — Voltage- and temperature-dependent barrier crossing rates.
-6. `MassActionKinetics` — Reversible stoichiometric binding and catalysis ($A + B \leftrightharpoons AB$).
-7. `HillCooperativity` — Cooperative saturating binding ($\frac{[L]^n}{K_d^n + [L]^n}$).
-8. `MarkovStateGraph` — Multi-state conformational transition matrices ($\frac{d\mathbf{p}}{dt} = Q(V, [L])\mathbf{p}$).
-9. `DiffusiveLaplacian` — Spatial diffusion ($D\nabla^2 c$) and axial compartmental cable coupling.
-10. `DelayedSynapticKernel` — Double-exponential impulse response and graph-routed coupling.
-11. `HomeostaticIntegralController` — Slow target-tracking feedback and metabolic autoregulation.
-12. `StochasticLangevinNoise` — Thermal ($k_B T$) and channel gating fluctuations ($\sqrt{2D}\,dW_t$).
-
----
-
-## Layer Breakdown
-
-### Layer 1: `layer1_axioms`
-- **`units.py`**: 7D SI dimensional algebra `[M, L, T, I, Theta, N, J]`, dynamic unit expression parser, Buckingham $\Pi$ nullspace solver, and CODATA physical constants.
-- **`hamiltonian.py`**: `LawBrick` base class, symplectic midpoint and RK4 integrators, and `CoupledPortHamiltonianSystem` with automatic cross-brick timescale scaling.
-- **`shields.py`**: Conservation checks for dimensions, mass stoichiometry, charge balance, 1st/2nd laws of thermodynamics, Wegscheider cycle balance, viable state bounds, and gated residual analysis for unmodeled dynamics.
-- **`vault.py`**: Two-tier law registry separating read-only core laws (`CORE_IMMUTABLE`) from quarantined discovered laws (`DISCOVERED_SANDBOX`).
-
-### Layer 2: `layer2_fabric`
-- **`primitives.py`**: Vectorized PyTorch implementations of the 16 differential primitives across 4 families, plus `PRIMITIVE_REGISTRY`.
-- **`mechanics_and_fields.py`**: `CentralForceHamiltonianBrick` (N-body gravitational / Coulomb / inverse-distance fields) and `NonlinearPendulumAndViscoelasticBrick`.
-- **`electrodynamics_and_circuits.py`**: `NonlinearConductanceCircuitBrick` (capacitive-conductive circuits with voltage-gated Boltzmann channels and Rush-Larsen integration).
-- **`kinetics_and_thermodynamics.py`**: `StoichiometricReactionBrick` (reversible mass-action kinetics and relative-entropy Lyapunov potential) and `CooperativeBindingBrick`.
-- **`transport_and_fields.py`**: `SpatialAdvectionDiffusionBrick` (O(N) matrix-free 1D and sparse graph Laplacian PDE field) and `EventImpulseCouplingBrick`.
-
-### Layer 3: `layer3_compiler`
-- **`ast_nodes.py`**: Symbolic equation tree representation.
-- **`tensor_compiler.py`**: Compiles symbolic trees into batched PyTorch tensor kernels (`[Batch, StateDim]`).
-- **`morphology_bridge.py`**: Maps `SAM 3.1` segmented cell geometry to compartmental capacitance and axial conductance tensors.
-
-### Layer 4: `layer4_engine`
-- **`elimination_funnel.py`**: 4-stage pruning pipeline (steady-state algebraic filter, parallel GPU sweep, differentiable inverse gradient homing, and stiff multi-timescale verification).
-
-### Layer 5: `layer5_proof`
-- **`falsification.py`**: Thermal noise ($k_B T$), parameter jitter ($\pm 20\%$), and metabolic stress testing.
-- **`identifiability.py`**: Complexity penalty and minimal equation selection.
-- **`rediscovery.py`**: Blind ground-up rediscovery benchmarks against empirical phenomena.
-
-### Layer 6: `layer6_agents`
-- **`council.py`**: Coordinates `SAM 3.1`, `Muse Spark`, `Muse Wonder`, `Muse Spark Open`, and `Muse Glimmer`.
-
-### Layer 7: `layer7_observatory`
-- **`server.py`**: FastAPI and WebSocket telemetry server for the web UI.
+5. **5-Scale Physical Realization & Sim-to-Real Verification (`layer6_agents/blueprint_compiler.py` & `deliverable_exporter.py`):**
+   - **Quantum-Thermodynamic Bridge:** Zero-Point Energy $E_{\text{ZPE}} = \frac{1}{2}\hbar\omega_{\text{vib}}$, Wigner tunneling transmission $\kappa_{\text{Wigner}} = 1 + \frac{1}{24}(\frac{\hbar\omega_{\text{vib}}}{k_B T_{\text{op}}})^2$, WKB penetration $\mathcal{T}_{\text{WKB}}$, and Marcus reorganization energy $\lambda_{\text{Marcus}} = 4\Delta G^\ddagger$.
+   - **Stoichiometric & Material Formulation:** Exact steady-state partition fractions ($\sum f_i = 100\%$), integer stoichiometry ($\nu_1:\nu_2:\dots$), $K_{\text{eq}}$, $K_d$, continuum elastic modulus $E$, Von Mises allowable stress $\sigma_{\text{allow}}$, Fourier thermal conductivity $\kappa_T$, and breakdown ceiling $T_{\text{crit}}$.
+   - **Parametric 3D CAD & Firmware:** Damköhler reaction-diffusion length $L_c = \sqrt{D_{\text{eff}}\tau}$, Laplace wall thickness $\delta_{\text{wall}}$, 3D-printable `.STL` and `.OBJ` meshes, vector `.SVG` engineering schematic, compilable ANSI C99 firmware (`.c`/`.h`), and standalone runnable Python digital-twin script (`.py`).
+   - **In-Silico Wet-Lab & HIL Verification:** Fluctuation-Dissipation Langevin SDE rollouts, Kramers barrier escape lifetime ($\tau_{\text{Kramers}}$), HIL Bode phase/gain margins ($\phi_m^\circ, G_m\text{ dB}$), 12-bit ADC quantized delayed rollout, Sobol global sensitivity indices ($S_i$), Six-Sigma process capability ($C_{pk}$), and Smoluchowski diffusion speed-limit ceilings ($\eta_{\text{Smol}} < 100\%$).

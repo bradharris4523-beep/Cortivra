@@ -8,9 +8,10 @@ into batched, differentiable `LawBrick` instances that enforce SI unit homogenei
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -28,12 +29,15 @@ from cortivra.layer1_axioms.units import (
     Quantity,
     Unit,
     m,
+    parse_unit,
     s,
 )
 from cortivra.layer3_compiler.ast_nodes import (
+    BinaryOpNode,
     ConstNode,
     ExprNode,
     SymbolNode,
+    UnaryOpNode,
     parse_symbolic_expr,
 )
 from cortivra.observability.flight_recorder import emit_trace_node
@@ -219,6 +223,8 @@ class CompiledLawBrick(LawBrick):
                 self._effort_asts.append(self.hamiltonian_ast.diff(sp.name).simplify())
             except Exception:
                 self._effort_asts.append(None)
+        self._all_efforts_symbolic = all(node is not None for node in self._effort_asts)
+        self._valid_effort_asts: list[ExprNode] = [node for node in self._effort_asts if node is not None]
 
         # 2. Compile skew-symmetric routing expressions J_{ij}(x, params) for i < j
         self._skew_asts: dict[tuple[int, int], tuple[ExprNode, float]] = {}
@@ -334,10 +340,13 @@ class CompiledLawBrick(LawBrick):
 
     def _build_env(self, state: torch.Tensor, params: torch.Tensor) -> dict[str, torch.Tensor]:
         env: dict[str, torch.Tensor] = {}
+        s_cols = state.unbind(dim=-1)
         for idx, sp in enumerate(self.state_specs):
-            env[sp.name] = state[:, idx]
-        for idx, pp in enumerate(self.param_specs):
-            env[pp.name] = params[:, idx]
+            env[sp.name] = s_cols[idx]
+        if self.param_specs:
+            p_cols = params.unbind(dim=-1)
+            for idx, pp in enumerate(self.param_specs):
+                env[pp.name] = p_cols[idx]
         return env
 
     def hamiltonian_energy(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
@@ -346,9 +355,13 @@ class CompiledLawBrick(LawBrick):
         return val * self._h_scale if abs(self._h_scale - 1.0) > 1e-12 else val
 
     def effort(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        if all(node is not None for node in self._effort_asts):
+        if self._all_efforts_symbolic:
             env = self._build_env(state, params)
-            cols = [node.eval_tensor(env) * self._h_scale for node in self._effort_asts if node is not None]
+            h_sc = self._h_scale
+            if abs(h_sc - 1.0) > 1e-12:
+                cols = [node.eval_tensor(env) * h_sc for node in self._valid_effort_asts]
+            else:
+                cols = [node.eval_tensor(env) for node in self._valid_effort_asts]
             return torch.stack(cols, dim=-1)
         return super().effort(state, params)
 
@@ -382,6 +395,45 @@ class CompiledLawBrick(LawBrick):
                     r_mat[:, i_s, j_s] = r_mat[:, i_s, j_s] + gamma * (nu_i * nu_j)
         return r_mat
 
+    def conservative_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        if not self._skew_asts:
+            return torch.zeros_like(state)
+        env = self._build_env(state, params)
+        if all(node is not None for node in self._effort_asts):
+            e_cols = [node.eval_tensor(env) * self._h_scale for node in self._effort_asts if node is not None]
+        else:
+            e_mat = super().effort(state, params)
+            e_cols = [e_mat[:, i] for i in range(self.state_dim)]
+        cols = [torch.zeros_like(state[:, i]) for i in range(self.state_dim)]
+        for (i, j), (node, scale) in self._skew_asts.items():
+            val = node.eval_tensor(env) * scale
+            cols[i] = cols[i] + val * e_cols[j]
+            cols[j] = cols[j] - val * e_cols[i]
+        return torch.stack(cols, dim=-1)
+
+    def dissipative_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        if not self._diss_asts and not self._onsager_channels:
+            return torch.zeros_like(state)
+        env = self._build_env(state, params)
+        if all(node is not None for node in self._effort_asts):
+            e_cols = [node.eval_tensor(env) * self._h_scale for node in self._effort_asts if node is not None]
+        else:
+            e_mat = super().effort(state, params)
+            e_cols = [e_mat[:, i] for i in range(self.state_dim)]
+        cols = [torch.zeros_like(state[:, i]) for i in range(self.state_dim)]
+        for idx, (node, scale) in enumerate(self._diss_asts):
+            val = torch.clamp(node.eval_tensor(env) * scale, min=0.0)
+            cols[idx] = cols[idx] + val * e_cols[idx]
+        for stoich, node, scale in self._onsager_channels:
+            gamma = torch.clamp(node.eval_tensor(env) * scale, min=0.0)
+            aff = torch.zeros_like(state[:, 0])
+            for i_s, nu_i in stoich:
+                aff = aff + nu_i * e_cols[i_s]
+            flux = gamma * aff
+            for i_s, nu_i in stoich:
+                cols[i_s] = cols[i_s] + nu_i * flux
+        return torch.stack(cols, dim=-1)
+
     def compute_compiled_external_drive(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """Evaluate compiled `external_drive_exprs` as a `[Batch, StateDim]` flow tensor."""
         if not self._drive_asts:
@@ -404,9 +456,88 @@ class CompiledLawBrick(LawBrick):
         params: torch.Tensor,
         port_inputs: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        dx_dt = super().flow(state, params, port_inputs=port_inputs)
+        env = self._build_env(state, params)
+        if self._all_efforts_symbolic:
+            h_sc = self._h_scale
+            if abs(h_sc - 1.0) > 1e-12:
+                e_cols = [node.eval_tensor(env) * h_sc for node in self._valid_effort_asts]
+            else:
+                e_cols = [node.eval_tensor(env) for node in self._valid_effort_asts]
+        else:
+            e_mat = super().effort(state, params)
+            e_cols = list(e_mat.unbind(dim=-1))
+
+        diss_cols: list[torch.Tensor | None] = [None] * self.state_dim
+        has_diss = bool(self._diss_asts or self._onsager_channels)
+        if has_diss:
+            for idx, (node, scale) in enumerate(self._diss_asts):
+                raw_d = node.eval_tensor(env)
+                val = torch.clamp(raw_d * scale if abs(scale - 1.0) > 1e-12 else raw_d, min=0.0)
+                diss_cols[idx] = val * e_cols[idx]
+            for stoich, node, scale in self._onsager_channels:
+                raw_g = node.eval_tensor(env)
+                gamma = torch.clamp(raw_g * scale if abs(scale - 1.0) > 1e-12 else raw_g, min=0.0)
+                i0, nu0 = stoich[0]
+                aff = e_cols[i0] if nu0 == 1.0 else (-e_cols[i0] if nu0 == -1.0 else nu0 * e_cols[i0])
+                for i_s, nu_i in stoich[1:]:
+                    if nu_i == 1.0:
+                        aff = aff + e_cols[i_s]
+                    elif nu_i == -1.0:
+                        aff = aff - e_cols[i_s]
+                    else:
+                        aff = aff + nu_i * e_cols[i_s]
+                flux = gamma * aff
+                for i_s, nu_i in stoich:
+                    term = flux if nu_i == 1.0 else (-flux if nu_i == -1.0 else nu_i * flux)
+                    prev_d = diss_cols[i_s]
+                    diss_cols[i_s] = term if prev_d is None else (prev_d + term)
+
+        cols: list[torch.Tensor | None] = [-d if d is not None else None for d in diss_cols]
+        if self._skew_asts:
+            for (i, j), (node, scale) in self._skew_asts.items():
+                raw_j = node.eval_tensor(env)
+                val = raw_j * scale if abs(scale - 1.0) > 1e-12 else raw_j
+                ti = val * e_cols[j]
+                tj = val * e_cols[i]
+                cols[i] = ti if cols[i] is None else (cols[i] + ti)
+                cols[j] = -tj if cols[j] is None else (cols[j] - tj)
+
+        if has_diss and self.thermal_sink_index is not None:
+            diss_pow: torch.Tensor | None = None
+            for i in range(self.state_dim):
+                d_i = diss_cols[i]
+                if d_i is not None:
+                    p_i = e_cols[i] * d_i
+                    diss_pow = p_i if diss_pow is None else (diss_pow + p_i)
+            if diss_pow is not None:
+                th_term = (
+                    diss_pow * self.thermal_capacity_scale
+                    if abs(self.thermal_capacity_scale - 1.0) > 1e-12
+                    else diss_pow
+                )
+                t_idx = self.thermal_sink_index
+                cols[t_idx] = th_term if cols[t_idx] is None else (cols[t_idx] + th_term)
+
         if self._drive_asts:
-            dx_dt = dx_dt + self.compute_compiled_external_drive(state, params)
+            for i, (node, scale) in enumerate(self._drive_asts):
+                if type(node) is ConstNode and node.value == 0.0:
+                    continue
+                raw_u = node.eval_tensor(env)
+                u_val = raw_u * scale if abs(scale - 1.0) > 1e-12 else raw_u
+                cols[i] = u_val if cols[i] is None else (cols[i] + u_val)
+
+        zero_col: torch.Tensor | None = None
+        final_cols: list[torch.Tensor] = []
+        for c in cols:
+            if c is None:
+                if zero_col is None:
+                    zero_col = torch.zeros_like(state[:, 0])
+                final_cols.append(zero_col)
+            else:
+                final_cols.append(c)
+        dx_dt = torch.stack(final_cols, dim=-1)
+        if port_inputs and "external_flow" in port_inputs:
+            dx_dt = dx_dt + port_inputs["external_flow"]
         return dx_dt
 
     def total_symbolic_complexity(self) -> int:
@@ -417,6 +548,83 @@ class CompiledLawBrick(LawBrick):
         total += sum(node.tree_complexity() for _, node, _ in self._onsager_channels)
         total += sum(node.tree_complexity() for node, _ in self._drive_asts)
         return total
+
+    def compile_effort_asts(self) -> list[ExprNode]:
+        """Return dimensionless SI-scaled symbolic effort ASTs `e_i(x, p) = dH/dx_i` for each state."""
+        efforts: list[ExprNode] = []
+        h_dimless = self.hamiltonian_ast.to_dimensionless_scaled_ast().simplify()
+        for idx, sp in enumerate(self.state_specs):
+            node = self._effort_asts[idx]
+            if node is not None:
+                e_ast = node.to_dimensionless_scaled_ast().simplify()
+            else:
+                try:
+                    e_ast = h_dimless.diff(sp.name).simplify()
+                except Exception:
+                    e_ast = ConstNode(0.0, DIMENSIONLESS)
+            if abs(self._h_scale - 1.0) > 1e-12:
+                e_ast = BinaryOpNode("*", ConstNode(self._h_scale, DIMENSIONLESS), e_ast).simplify()
+            efforts.append(e_ast)
+        return efforts
+
+    def compile_flow_asts(self) -> list[ExprNode]:
+        """
+        Return dimensionless SI-scaled symbolic ODE vector field ASTs
+        `dx_i/dt = (J(x) - R(x)) grad_H(x) + u_ext(x)` for each state `i`.
+        """
+        efforts = self.compile_effort_asts()
+        flows: list[ExprNode] = [ConstNode(0.0, DIMENSIONLESS) for _ in range(self.state_dim)]
+
+        # 1. Conservative skew-symmetric routing J(x) * e(x)
+        for (i, j), (j_node, j_scale) in self._skew_asts.items():
+            j_ast = j_node.to_dimensionless_scaled_ast().simplify()
+            if abs(j_scale - 1.0) > 1e-12:
+                j_ast = BinaryOpNode("*", ConstNode(j_scale, DIMENSIONLESS), j_ast).simplify()
+            term_i = BinaryOpNode("*", j_ast, efforts[j]).simplify()
+            term_j = BinaryOpNode("*", j_ast, efforts[i]).simplify()
+            flows[i] = BinaryOpNode("+", flows[i], term_i).simplify()
+            flows[j] = BinaryOpNode("-", flows[j], term_j).simplify()
+
+        # 2. Diagonal dissipation -R_ii(x) * e_i(x)
+        diss_terms: list[ExprNode] = []
+        for idx, (r_node, r_scale) in enumerate(self._diss_asts):
+            r_ast = r_node.to_dimensionless_scaled_ast().simplify()
+            if abs(r_scale - 1.0) > 1e-12:
+                r_ast = BinaryOpNode("*", ConstNode(r_scale, DIMENSIONLESS), r_ast).simplify()
+            d_term = BinaryOpNode("*", r_ast, efforts[idx]).simplify()
+            diss_terms.append(d_term)
+            flows[idx] = BinaryOpNode("-", flows[idx], d_term).simplify()
+
+        # 3. Off-diagonal Onsager dissipative channels -R_onsager(x) * e(x)
+        for stoich, g_node, g_scale in self._onsager_channels:
+            g_ast = g_node.to_dimensionless_scaled_ast().simplify()
+            if abs(g_scale - 1.0) > 1e-12:
+                g_ast = BinaryOpNode("*", ConstNode(g_scale, DIMENSIONLESS), g_ast).simplify()
+            for i_s, nu_i in stoich:
+                for j_s, nu_j in stoich:
+                    coeff = nu_i * nu_j
+                    c_ast = BinaryOpNode("*", ConstNode(coeff, DIMENSIONLESS), g_ast).simplify()
+                    term_ij = BinaryOpNode("*", c_ast, efforts[j_s]).simplify()
+                    flows[i_s] = BinaryOpNode("-", flows[i_s], term_ij).simplify()
+
+        # 4. GENERIC 1st-Law thermal sink routing (+D(x) / C_th into thermal_sink_state_name)
+        if self.thermal_sink_index is not None and diss_terms:
+            d_pow: ExprNode = ConstNode(0.0, DIMENSIONLESS)
+            for idx, d_term in enumerate(diss_terms):
+                d_pow = BinaryOpNode("+", d_pow, BinaryOpNode("*", efforts[idx], d_term)).simplify()
+            if abs(self.thermal_capacity_scale - 1.0) > 1e-12:
+                d_pow = BinaryOpNode("*", ConstNode(self.thermal_capacity_scale, DIMENSIONLESS), d_pow).simplify()
+            t_idx = self.thermal_sink_index
+            flows[t_idx] = BinaryOpNode("+", flows[t_idx], d_pow).simplify()
+
+        # 5. External drive u_ext(x, p)
+        for idx, (u_node, u_scale) in enumerate(self._drive_asts):
+            u_ast = u_node.to_dimensionless_scaled_ast().simplify()
+            if abs(u_scale - 1.0) > 1e-12:
+                u_ast = BinaryOpNode("*", ConstNode(u_scale, DIMENSIONLESS), u_ast).simplify()
+            flows[idx] = BinaryOpNode("+", flows[idx], u_ast).simplify()
+
+        return flows
 
 
 class ResidualPatchedLawBrick(LawBrick):
@@ -604,8 +812,14 @@ class ResidualPatchedLawBrick(LawBrick):
             f_diss = f_diss + torch.stack(deltas, dim=-1)
         return f_diss
 
-    def compute_active_patch_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        """Return the `[Batch, StateDim]` flow contributed by an `"active_driven"` patch."""
+    def compute_compiled_external_drive(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """Delegate external drive flow computation through nested ResidualPatchedLawBrick layers."""
+        if hasattr(self.base_brick, "compute_compiled_external_drive"):
+            return self.base_brick.compute_compiled_external_drive(state, params[:, : self.base_param_dim])
+        return torch.zeros_like(state)
+
+    def _own_active_patch_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """Return the `[Batch, StateDim]` flow contributed strictly by this layer's `"active_driven"` patch."""
         if self.thermodynamic_mode != "active_driven":
             return torch.zeros_like(state)
         env = self._build_env(state, params)
@@ -615,19 +829,23 @@ class ResidualPatchedLawBrick(LawBrick):
             deltas[key] = deltas[key] + node.eval_tensor(env) * scale
         return torch.stack(deltas, dim=-1)
 
+    def compute_active_patch_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """Return the cumulative `[Batch, StateDim]` flow contributed by all nested `"active_driven"` patches."""
+        base_p = params[:, : self.base_param_dim]
+        flow_act = (
+            self.base_brick.compute_active_patch_flow(state, base_p)
+            if hasattr(self.base_brick, "compute_active_patch_flow")
+            else torch.zeros_like(state)
+        )
+        if self.thermodynamic_mode == "active_driven":
+            flow_act = flow_act + self._own_active_patch_flow(state, params)
+        return flow_act
+
     def external_patch_power(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """Compute instantaneous power `P_ext = grad_H(x) . Phi_patch(x)` supplied by external drive and `"active_driven"` patches."""
-        p_ext = torch.zeros((state.shape[0],), dtype=state.dtype, device=state.device)
-        base_p = params[:, : self.base_param_dim]
-        if hasattr(self.base_brick, "external_drive_power"):
-            p_ext = p_ext + self.base_brick.external_drive_power(state, base_p)
-        if hasattr(self.base_brick, "external_patch_power"):
-            p_ext = p_ext + self.base_brick.external_patch_power(state, base_p)
-        if self.thermodynamic_mode == "active_driven":
-            e = self.effort(state, params)
-            phi = self.compute_active_patch_flow(state, params)
-            p_ext = p_ext + (e * phi).sum(dim=-1)
-        return p_ext
+        e = self.effort(state, params)
+        ext_flow = self.compute_compiled_external_drive(state, params) + self.compute_active_patch_flow(state, params)
+        return (e * ext_flow).sum(dim=-1)
 
     def flow(
         self,
@@ -635,19 +853,86 @@ class ResidualPatchedLawBrick(LawBrick):
         params: torch.Tensor,
         port_inputs: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        dx_dt = super().flow(state, params, port_inputs=port_inputs)
         base_p = params[:, : self.base_param_dim]
-        if hasattr(self.base_brick, "compute_compiled_external_drive"):
-            dx_dt = dx_dt + self.base_brick.compute_compiled_external_drive(state, base_p)
-        if hasattr(self.base_brick, "compute_active_patch_flow"):
-            dx_dt = dx_dt + self.base_brick.compute_active_patch_flow(state, base_p)
+        dx_dt = self.base_brick.flow(state, base_p, port_inputs=port_inputs)
         if self.thermodynamic_mode == "active_driven":
-            dx_dt = dx_dt + self.compute_active_patch_flow(state, params)
+            return dx_dt + self._own_active_patch_flow(state, params)
+        if self.thermodynamic_mode == "conservative_coupling":
+            env = self._build_env(state, params)
+            e = self.effort(state, params)
+            deltas = [torch.zeros_like(state[:, idx]) for idx in range(self.state_dim)]
+            for key, (node, scale) in self._compiled_patches.items():
+                assert isinstance(key, tuple)
+                i, j = key
+                val = node.eval_tensor(env) * scale
+                deltas[i] = deltas[i] + val * e[:, j]
+                deltas[j] = deltas[j] - val * e[:, i]
+            return dx_dt + torch.stack(deltas, dim=-1)
+        if self.thermodynamic_mode == "passive_dissipative":
+            env = self._build_env(state, params)
+            e = self.effort(state, params)
+            deltas = [torch.zeros_like(state[:, idx]) for idx in range(self.state_dim)]
+            for key, (node, scale) in self._compiled_patches.items():
+                val = torch.clamp(node.eval_tensor(env) * scale, min=0.0)
+                if isinstance(key, int):
+                    deltas[key] = deltas[key] + val * e[:, key]
+                else:
+                    i_p, j_p = key
+                    flux_ij = val * (e[:, i_p] - e[:, j_p])
+                    deltas[i_p] = deltas[i_p] + flux_ij
+                    deltas[j_p] = deltas[j_p] - flux_ij
+            if self.thermal_sink_index is not None:
+                diss_pow = torch.zeros_like(state[:, 0])
+                for i in range(self.state_dim):
+                    diss_pow = diss_pow + e[:, i] * deltas[i]
+                deltas[self.thermal_sink_index] = (
+                    deltas[self.thermal_sink_index] - diss_pow * self.thermal_capacity_scale
+                )
+            return dx_dt - torch.stack(deltas, dim=-1)
         return dx_dt
 
     def total_patch_complexity(self) -> int:
         """Return total AST node complexity across all compiled patch expressions."""
         return sum(node.tree_complexity() for node, _ in self._compiled_patches.values())
+
+    def compile_effort_asts(self) -> list[ExprNode]:
+        """Return dimensionless SI-scaled symbolic effort ASTs from the underlying base brick."""
+        if hasattr(self.base_brick, "compile_effort_asts"):
+            return list(self.base_brick.compile_effort_asts())
+        return [SymbolNode(sp.name, DIMENSIONLESS, role="state") for sp in self.state_specs]
+
+    def compile_flow_asts(self) -> list[ExprNode]:
+        """Return dimensionless SI-scaled symbolic ODE vector field ASTs including all patches."""
+        if hasattr(self.base_brick, "compile_flow_asts"):
+            flows = list(self.base_brick.compile_flow_asts())
+        else:
+            flows = [ConstNode(0.0, DIMENSIONLESS) for _ in range(self.state_dim)]
+        efforts = self.compile_effort_asts()
+
+        for key, (node, scale) in self._compiled_patches.items():
+            p_ast = node.to_dimensionless_scaled_ast().simplify()
+            if abs(scale - 1.0) > 1e-12:
+                p_ast = BinaryOpNode("*", ConstNode(scale, DIMENSIONLESS), p_ast).simplify()
+            if self.thermodynamic_mode == "active_driven":
+                assert isinstance(key, int)
+                flows[key] = BinaryOpNode("+", flows[key], p_ast).simplify()
+            elif self.thermodynamic_mode == "passive_dissipative":
+                if isinstance(key, int):
+                    d_term = BinaryOpNode("*", p_ast, efforts[key]).simplify()
+                    flows[key] = BinaryOpNode("-", flows[key], d_term).simplify()
+                else:
+                    i_p, j_p = key
+                    diff_e = BinaryOpNode("-", efforts[i_p], efforts[j_p]).simplify()
+                    flux_ij = BinaryOpNode("*", p_ast, diff_e).simplify()
+                    flows[i_p] = BinaryOpNode("-", flows[i_p], flux_ij).simplify()
+                    flows[j_p] = BinaryOpNode("+", flows[j_p], flux_ij).simplify()
+            elif self.thermodynamic_mode == "conservative_coupling":
+                assert isinstance(key, tuple)
+                i_c, j_c = key
+                flows[i_c] = BinaryOpNode("+", flows[i_c], BinaryOpNode("*", p_ast, efforts[j_c])).simplify()
+                flows[j_c] = BinaryOpNode("-", flows[j_c], BinaryOpNode("*", p_ast, efforts[i_c])).simplify()
+
+        return flows
 
 
 def compile_symbolic_system(spec: SymbolicSystemSpec) -> CompiledLawBrick:
@@ -703,3 +988,169 @@ def compile_residual_patch_brick(
         skip_if_inner_loop=True,
     )
     return brick
+
+
+def _split_top_level_additive_terms(node: ExprNode) -> list[ExprNode]:
+    """Decompose an `ExprNode` into top-level additive (`+` / `-`) sub-expressions."""
+    if isinstance(node, BinaryOpNode) and node.op in ("+", "-"):
+        return _split_top_level_additive_terms(node.left) + _split_top_level_additive_terms(node.right)
+    if isinstance(node, UnaryOpNode) and node.op in ("+", "-"):
+        return _split_top_level_additive_terms(node.operand)
+    return [node]
+
+
+def _solve_expression_dimensional_constraints(
+    expr_str: str,
+    target_unit: Unit,
+    state_units: dict[str, Unit],
+    param_units: dict[str, Unit],
+    locked_params: set[str],
+) -> None:
+    """
+    Solve the 7D SI dimensional linear equation for any parameter in `expr_str` whose current
+    unit prevents `expr_str` (or any additive sub-term) from evaluating to `target_unit`.
+    """
+    symbol_table: dict[str, SymbolNode | ConstNode] = {}
+    for s_name, s_u in state_units.items():
+        symbol_table[s_name] = SymbolNode(s_name, s_u, role="state")
+    for p_name, p_u in param_units.items():
+        symbol_table[p_name] = SymbolNode(p_name, p_u, role="param")
+
+    try:
+        root = parse_symbolic_expr(expr_str, symbol_table=symbol_table)
+    except Exception:
+        return
+
+    terms = _split_top_level_additive_terms(root)
+    for term in terms:
+        try:
+            u = term.infer_unit()
+            if u.dimension == target_unit.dimension or (
+                isinstance(term, ConstNode) and term.value == 0.0
+            ):
+                continue
+        except Exception:
+            pass
+
+        cand_params = [p for p in term.free_symbols() if p in param_units]
+        ordered_cands = [p for p in cand_params if p not in locked_params] + [
+            p for p in cand_params if p in locked_params
+        ]
+        for p_cand in ordered_cands:
+            test_table_0 = dict(symbol_table)
+            test_table_0[p_cand] = SymbolNode(p_cand, DIMENSIONLESS, role="param")
+            try:
+                term_0 = parse_symbolic_expr(term.to_infix(), symbol_table=test_table_0)
+                u_0 = term_0.infer_unit()
+            except Exception:
+                continue
+
+            req_u = target_unit / u_0
+            test_table_req = dict(symbol_table)
+            test_table_req[p_cand] = SymbolNode(p_cand, req_u, role="param")
+            try:
+                term_req = parse_symbolic_expr(term.to_infix(), symbol_table=test_table_req)
+                u_check = term_req.infer_unit()
+                if u_check.dimension == target_unit.dimension:
+                    param_units[p_cand] = req_u
+                    symbol_table[p_cand] = SymbolNode(p_cand, req_u, role="param")
+                    locked_params.add(p_cand)
+                    break
+            except Exception:
+                continue
+
+
+def repair_and_unify_symbolic_spec_dict(
+    candidate_spec: dict[str, Any],
+    diagnostic_error: str = "",
+) -> tuple[dict[str, Any], list[str]]:
+    """
+    Layer 3 AST Dimensional & Thermodynamic Unification Solver:
+    Resolves 7D SI dimensional incompatibilities across `hamiltonian_expr`, `dissipation_diag_exprs`,
+    `skew_routing_exprs`, and `external_drive_exprs`, and enforces 2nd-Law non-negativity on
+    passive dissipation parameters.
+    """
+    spec = copy.deepcopy(candidate_spec)
+    state_units: dict[str, Unit] = {}
+    ordered_state_units: list[Unit] = []
+    for sp in spec.get("state_specs", []):
+        u = parse_unit(sp.get("unit", "1"))
+        state_units[sp["name"]] = u
+        ordered_state_units.append(u)
+
+    param_units: dict[str, Unit] = {}
+    for pp in spec.get("param_specs", []):
+        param_units[pp["name"]] = parse_unit(pp.get("unit", "1"))
+
+    energy_u = parse_unit(spec.get("energy_unit", "J"))
+    time_u = parse_unit(spec.get("time_unit", "s"))
+    locked: set[str] = set()
+
+    h_expr = str(spec.get("hamiltonian_expr", "0.0"))
+    _solve_expression_dimensional_constraints(
+        h_expr, energy_u, state_units, param_units, locked
+    )
+
+    diss_exprs = list(spec.get("dissipation_diag_exprs", []))
+    for idx, d_expr in enumerate(diss_exprs):
+        if idx < len(ordered_state_units):
+            req_r_unit = (ordered_state_units[idx] ** 2) / (energy_u * time_u)
+            _solve_expression_dimensional_constraints(
+                str(d_expr), req_r_unit, state_units, param_units, locked
+            )
+
+    skew_dict = dict(spec.get("skew_routing_exprs", {}))
+    for k_str, j_expr in skew_dict.items():
+        parts = [int(p.strip()) for p in str(k_str).replace("(", "").replace(")", "").split(",")]
+        if len(parts) == 2 and 0 <= parts[0] < len(ordered_state_units) and 0 <= parts[1] < len(ordered_state_units):
+            req_j_unit = (ordered_state_units[parts[0]] * ordered_state_units[parts[1]]) / (
+                energy_u * time_u
+            )
+            _solve_expression_dimensional_constraints(
+                str(j_expr), req_j_unit, state_units, param_units, locked
+            )
+
+    drive_exprs = list(spec.get("external_drive_exprs", []))
+    for idx, u_expr in enumerate(drive_exprs):
+        if idx < len(ordered_state_units):
+            req_u_unit = ordered_state_units[idx] / time_u
+            _solve_expression_dimensional_constraints(
+                str(u_expr), req_u_unit, state_units, param_units, locked
+            )
+
+    repaired_notes: list[str] = []
+    for pp in spec.get("param_specs", []):
+        p_name = pp["name"]
+        solved_u = param_units[p_name]
+        old_u = parse_unit(pp.get("unit", "1"))
+        if solved_u.dimension != old_u.dimension:
+            new_sym = solved_u.dimension.format_si()
+            pp["unit"] = new_sym
+            repaired_notes.append(f"Unified unit({p_name}) from '{old_u.symbol}' to '{new_sym}'")
+
+        val = float(pp.get("default_value", 1.0))
+        min_v = float(pp.get("min_value", 0.0))
+        in_diss = any(p_name in str(de) for de in diss_exprs)
+        if in_diss and (
+            val < 0.0
+            or min_v < 0.0
+            or "2nd Law" in diagnostic_error
+            or "Dissipation" in diagnostic_error
+            or "negative" in diagnostic_error.lower()
+        ):
+            if val < 0.0:
+                pp["default_value"] = abs(val)
+                repaired_notes.append(
+                    f"Enforced 2nd-Law non-negativity on dissipation parameter '{p_name}'={abs(val)}"
+                )
+            if min_v < 0.0:
+                pp["min_value"] = 0.0
+
+    for idx, d_expr in enumerate(diss_exprs):
+        d_clean = str(d_expr).strip()
+        if d_clean.startswith("-"):
+            diss_exprs[idx] = d_clean.lstrip("-").strip()
+            repaired_notes.append(f"Removed negative sign on dissipation_diag_exprs[{idx}]")
+    spec["dissipation_diag_exprs"] = diss_exprs
+    return spec, repaired_notes
+

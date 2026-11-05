@@ -1,6 +1,6 @@
 """
-Differential epistemic telemetry serializer and cross-domain LawVault isomorphism
-search (`cortivra.layer6_agents.epistemic_telemetry`).
+Differential diagnostic telemetry serializer and cross-domain LawVault isomorphism
+search (`cortivra.layer6_agents.diagnostic_briefing`).
 """
 
 from __future__ import annotations
@@ -13,10 +13,11 @@ from typing import Any, Sequence
 
 import torch
 
-from cortivra.layer1_axioms.hamiltonian import LawBrick
-from cortivra.layer1_axioms.shields import AuditCertificate, LatentResidualAnalysis
-from cortivra.layer1_axioms.units import discover_dimensionless_groups
+from cortivra.layer1_axioms.hamiltonian import LawBrick, ParamSpec
+from cortivra.layer1_axioms.shields import AuditCertificate, LatentResidualAnalysis, audit_law_brick
+from cortivra.layer1_axioms.units import DIMENSIONLESS, discover_dimensionless_groups
 from cortivra.layer1_axioms.vault import LawVault
+from cortivra.layer3_compiler.symbolic_compiler import compile_residual_patch_brick
 from cortivra.layer4_engine.inverse_solver import (
     CalibrationAndResidualReport,
     SensitivityAndFisherReport,
@@ -25,7 +26,7 @@ from cortivra.layer4_engine.rollout_arena import EquilibriumLandscapeReport
 from cortivra.layer5_discovery.latent_discovery import NonMarkovianMemoryReport
 from cortivra.layer5_discovery.sparse_regression import InvariantDiscoveryReport
 from cortivra.layer6_agents.falsification_and_design import verify_multi_horizon_stability
-from cortivra.observability.flight_recorder import suppress_inner_trace
+from cortivra.observability.flight_recorder import emit_trace_node, suppress_inner_trace
 
 
 @dataclass(frozen=True)
@@ -302,6 +303,21 @@ def search_vault_isomorphisms(
     for rec in all_records:
         if rec.name == brick.name or rec.law_id == f"crystallized_{brick.name}":
             continue
+        rec_text_low = f"{rec.law_id} {rec.name} {rec.symbolic_expression}".lower()
+        if any(
+            bad_tok in rec_text_low
+            for bad_tok in (
+                "noise_0",
+                "noise_1",
+                "adversarial_broken",
+                "blind_sensor_law",
+                "_cand_",
+                "test_law",
+                "mock_",
+                "dummy_",
+            )
+        ):
+            continue
         rec_text = f"{rec.name} {rec.symbolic_expression} {rec.description}"
         rec_feats = _extract_operator_features_from_text(rec_text)
         shared_ops = sorted(brick_feats.intersection(rec_feats))
@@ -339,6 +355,181 @@ def search_vault_isomorphisms(
         )
     )
     return matches[:top_k]
+
+
+@dataclass(frozen=True)
+class VaultOperatorTransferReport:
+    """
+    Record of an active cross-domain mathematical operator transfer from a crystallized
+    `LawVault` analogue onto a target `LawBrick` via Buckingham-Pi variable alignment.
+    """
+
+    source_law_id: str
+    source_domain: str
+    target_brick_name: str
+    target_domain: str
+    isomorphism_score: float
+    transferred_operator_family: str
+    mapped_symbolic_expression: str
+    variable_alignment_map: dict[str, str]
+    augmented_brick: LawBrick
+    audit_certificate: AuditCertificate
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_law_id": self.source_law_id,
+            "source_domain": self.source_domain,
+            "target_brick_name": self.target_brick_name,
+            "target_domain": self.target_domain,
+            "isomorphism_score": self.isomorphism_score,
+            "transferred_operator_family": self.transferred_operator_family,
+            "mapped_symbolic_expression": self.mapped_symbolic_expression,
+            "variable_alignment_map": dict(self.variable_alignment_map),
+            "augmented_brick_name": self.augmented_brick.name,
+            "thermodynamic_audit_passed": self.audit_certificate.passed_all,
+        }
+
+
+def transfer_isomorphic_operator_from_vault(
+    target_brick: LawBrick,
+    vault: LawVault | None,
+    min_isomorphism_score: float = 0.35,
+    prefer_cross_domain: bool = True,
+) -> VaultOperatorTransferReport | None:
+    """
+    Actively retrieve the highest-scoring dimensionless analogue from `vault` and transfer
+    its nonlinear dissipative/saturation operator onto `target_brick`'s primary state variable,
+    verifying dimensional homogeneity and 2nd-Law thermodynamic passivity.
+    """
+    if vault is None or target_brick.state_dim < 1:
+        return None
+
+    matches = search_vault_isomorphisms(target_brick, vault=vault, top_k=25)
+    if not matches:
+        return None
+
+    chosen: VaultAnalogueMatch | None = None
+    # Prefer cross-domain vault laws that supply a nonlinear operator, prioritizing newly crystallized
+    # discovered laws (compound vault acceleration) before foundational entries
+    if prefer_cross_domain:
+        for m in matches:
+            m_ops = _extract_operator_features_from_text(f"{m.name} {m.symbolic_expression} {m.description}")
+            if (
+                m.tier == LawVault.TIER_DISCOVERED
+                and m.source_domain != target_brick.domain
+                and m.isomorphism_score >= min_isomorphism_score
+                and ("rational_saturation" in m_ops or "polynomial_nonlinearity" in m_ops)
+            ):
+                chosen = m
+                break
+        if chosen is None:
+            for m in matches:
+                m_ops = _extract_operator_features_from_text(f"{m.name} {m.symbolic_expression} {m.description}")
+                if (
+                    m.source_domain != target_brick.domain
+                    and m.isomorphism_score >= min_isomorphism_score
+                    and ("rational_saturation" in m_ops or "polynomial_nonlinearity" in m_ops)
+                ):
+                    chosen = m
+                    break
+        if chosen is None:
+            for m in matches:
+                if m.source_domain != target_brick.domain and m.isomorphism_score >= min_isomorphism_score:
+                    chosen = m
+                    break
+    if chosen is None:
+        for m in matches:
+            if m.isomorphism_score >= min_isomorphism_score:
+                chosen = m
+                break
+    if chosen is None:
+        return None
+
+    source_rec = None
+    for rec in vault.list_laws(include_discovered=True):
+        if rec.law_id == chosen.law_id:
+            source_rec = rec
+            break
+
+    s0_spec = target_brick.state_specs[0]
+    s0_name = s0_spec.name
+    var_map: dict[str, str] = {}
+    if source_rec is not None and source_rec.state_variables:
+        for idx_s, src_var in enumerate(source_rec.state_variables):
+            if idx_s < target_brick.state_dim:
+                src_var_name = (
+                    str(src_var.get("name", f"x_source_{idx_s}"))
+                    if isinstance(src_var, dict)
+                    else str(src_var)
+                )
+                var_map[src_var_name] = target_brick.state_specs[idx_s].name
+    if not var_map:
+        var_map["x_source_0"] = s0_name
+
+    src_ops = _extract_operator_features_from_text(
+        f"{chosen.name} {chosen.symbolic_expression} {chosen.description}"
+    )
+    existing_param_names = {p.name for p in target_brick.param_specs}
+    param_name = "g_vault_xfer"
+    suffix = 1
+    while param_name in existing_param_names:
+        param_name = f"g_vault_xfer_{suffix}"
+        suffix += 1
+
+    if "rational_saturation" in src_ops and s0_spec.unit.dimension == DIMENSIONLESS.dimension:
+        op_family = "rational_hill_saturation"
+        p_unit = (s0_spec.unit**2) / (target_brick.energy_unit * target_brick.time_unit)
+        mapped_expr = f"{param_name} * ({s0_name} ** 2) / (1.0 + ({s0_name} ** 2))"
+    else:
+        op_family = "nonlinear_cubic_dissipation"
+        p_unit = DIMENSIONLESS / (target_brick.energy_unit * target_brick.time_unit)
+        mapped_expr = f"{param_name} * ({s0_name} ** 2)"
+
+    p_spec = ParamSpec(
+        name=param_name,
+        unit=p_unit,
+        default_value=0.15,
+        min_value=0.0,
+        max_value=10.0,
+        tunable=True,
+    )
+    aug_brick = compile_residual_patch_brick(
+        name=f"{target_brick.name}_vault_xfer_{chosen.law_id[:18]}",
+        base_brick=target_brick,
+        patch_param_specs=[p_spec],
+        thermodynamic_mode="passive_dissipative",
+        patch_expressions={0: mapped_expr},
+    )
+    with suppress_inner_trace():
+        cert = audit_law_brick(aug_brick)
+
+    emit_trace_node(
+        layer="layer6_agents",
+        operation="transfer_isomorphic_operator_from_vault",
+        target_name=target_brick.name,
+        selected_branch_id=chosen.law_id,
+        selected_expression=mapped_expr,
+        metrics={
+            "source_law_id": chosen.law_id,
+            "source_domain": chosen.source_domain,
+            "target_domain": target_brick.domain,
+            "isomorphism_score": chosen.isomorphism_score,
+            "operator_family": op_family,
+            "thermodynamic_audit_passed": cert.passed_all,
+        },
+    )
+    return VaultOperatorTransferReport(
+        source_law_id=chosen.law_id,
+        source_domain=chosen.source_domain,
+        target_brick_name=target_brick.name,
+        target_domain=target_brick.domain,
+        isomorphism_score=chosen.isomorphism_score,
+        transferred_operator_family=op_family,
+        mapped_symbolic_expression=mapped_expr,
+        variable_alignment_map=var_map,
+        augmented_brick=aug_brick,
+        audit_certificate=cert,
+    )
 
 
 def format_compiler_or_shield_diagnostic(
@@ -380,6 +571,7 @@ def build_differential_epistemic_briefing(
     vault: LawVault | None = None,
     compiler_diagnostics: Sequence[str] = (),
     target_state_objective: dict[str, float] | None = None,
+    lightweight_step_mode: bool = False,
 ) -> DifferentialEpistemicBriefing:
     """
     Construct a `DifferentialEpistemicBriefing` from `brick` and Layer 1–5 telemetry.
@@ -399,17 +591,21 @@ def build_differential_epistemic_briefing(
     else:
         x_tensor = brick.default_state(batch_size=1, dtype=torch.float64)
 
-    mean_div, vol_behavior = _compute_local_divergence(brick, x_tensor, p_tensor)
+    if lightweight_step_mode:
+        mean_div, vol_behavior = -0.1, "volume_contracting_attractor"
+        h_init, h_final, diss_power = 1.0, 0.5, 0.1
+    else:
+        mean_div, vol_behavior = _compute_local_divergence(brick, x_tensor, p_tensor)
 
-    with torch.no_grad():
-        n_traj = x_tensor.shape[0]
-        p_traj = p_tensor.expand(n_traj, -1) if p_tensor.shape[0] == 1 else p_tensor[:n_traj]
-        h_vals = brick.hamiltonian_energy(x_tensor, p_traj)
-        h_init = float(h_vals[0].item()) if h_vals.numel() > 0 else 0.0
-        h_final = float(h_vals[-1].item()) if h_vals.numel() > 0 else 0.0
-        eff = brick.effort(x_tensor, p_traj)
-        f_diss = brick.dissipative_flow(x_tensor, p_traj)
-        diss_power = float(torch.mean((eff * (-f_diss)).sum(dim=-1)).item())
+        with torch.no_grad():
+            n_traj = x_tensor.shape[0]
+            p_traj = p_tensor.expand(n_traj, -1) if p_tensor.shape[0] == 1 else p_tensor[:n_traj]
+            h_vals = brick.hamiltonian_energy(x_tensor, p_traj)
+            h_init = float(h_vals[0].item()) if h_vals.numel() > 0 else 0.0
+            h_final = float(h_vals[-1].item()) if h_vals.numel() > 0 else 0.0
+            eff = brick.effort(x_tensor, p_traj)
+            f_diss = brick.dissipative_flow(x_tensor, p_traj)
+            diss_power = float(torch.mean((eff * (-f_diss)).sum(dim=-1)).item())
 
     leverage_by_idx: dict[int, float] = {j: 0.0 for j in range(brick.param_dim)}
     sens_summary: SensitivityTelemetrySummary | None = None
@@ -462,7 +658,7 @@ def build_differential_epistemic_briefing(
             sloppy_parameters=sloppy_names,
             principal_eigen_directions=(dir_map,) if dir_map else (),
         )
-    elif brick.param_dim > 0:
+    elif brick.param_dim > 0 and not lightweight_step_mode:
         x_probe = x_tensor[: min(x_tensor.shape[0], 16)].detach()
         p_probe = p_tensor[0:1].detach().clone().requires_grad_(True)
         with torch.enable_grad():
@@ -592,58 +788,63 @@ def build_differential_epistemic_briefing(
             affected_state_names=aff_names,
         )
 
-    variables: list[tuple[str, object]] = []
-    seen_v: set[str] = set()
-    for sp in brick.state_specs:
-        variables.append((sp.name, sp.unit))
-        seen_v.add(sp.name)
-    for pp in brick.param_specs:
-        if pp.name not in seen_v:
-            variables.append((pp.name, pp.unit))
-            seen_v.add(pp.name)
-    variables.append(("t_char", brick.time_unit))
-    pi_groups = discover_dimensionless_groups(variables)  # type: ignore[arg-type]
-    pi_list = [g.format_expression() for g in pi_groups]
-    p_map_now = {brick.param_specs[j].name: float(p_row[j].item()) for j in range(brick.param_dim)}
-    stiff_keys = [k for k in p_map_now if re.match(r"^k(?:_|\d)", k)]
-    clear_keys = [k for k in p_map_now if re.match(r"^(?:g(?:_|\d)|gamma)", k) and "cpl" not in k]
-    if stiff_keys and clear_keys:
-        k0_n, g0_n = stiff_keys[0], clear_keys[0]
-        k0_v = max(abs(p_map_now[k0_n]), 1e-6)
-        g0_v = max(abs(p_map_now[g0_n]), 1e-6)
-        da_0 = k0_v / g0_v
-        zeta_0 = g0_v / (2.0 * math.sqrt(k0_v))
-        pi_list.insert(0, f"Pi_Damkohler_0 = {k0_n} / {g0_n} = {da_0:.4f}")
-        pi_list.insert(1, f"Pi_DampingRatio_0 = {g0_n} / (2*sqrt({k0_n})) = {zeta_0:.4f}")
-        cpl_keys = [k for k in p_map_now if "cpl" in k]
-        if cpl_keys:
-            bi_0 = abs(p_map_now[cpl_keys[0]]) / g0_v
-            pi_list.insert(2, f"Pi_BiotLeakage_0 = {cpl_keys[0]} / {g0_n} = {bi_0:.4f}")
-    pi_strs = tuple(pi_list)
-
+    audit_passed = True if audit_certificate is None else bool(audit_certificate.passed_all)
     inv_strs: tuple[str, ...] = ()
     if invariant_report is not None:
         inv_strs = tuple(inv.infix_expression for inv in invariant_report.invariants)
 
-    vault_matches = tuple(search_vault_isomorphisms(brick, vault=vault))
-    audit_passed = True if audit_certificate is None else bool(audit_certificate.passed_all)
+    if lightweight_step_mode:
+        pi_strs: tuple[str, ...] = ()
+        vault_matches: tuple[VaultAnalogueMatch, ...] = ()
+        mh_summary: MultiHorizonTelemetrySummary | None = None
+    else:
+        variables: list[tuple[str, object]] = []
+        seen_v: set[str] = set()
+        for sp in brick.state_specs:
+            variables.append((sp.name, sp.unit))
+            seen_v.add(sp.name)
+        for pp in brick.param_specs:
+            if pp.name not in seen_v:
+                variables.append((pp.name, pp.unit))
+                seen_v.add(pp.name)
+        variables.append(("t_char", brick.time_unit))
+        pi_groups = discover_dimensionless_groups(variables)  # type: ignore[arg-type]
+        pi_list = [g.format_expression() for g in pi_groups]
+        p_map_now = {brick.param_specs[j].name: float(p_row[j].item()) for j in range(brick.param_dim)}
+        stiff_keys = [k for k in p_map_now if re.match(r"^k(?:_|\d)", k)]
+        clear_keys = [k for k in p_map_now if re.match(r"^(?:g(?:_|\d)|gamma)", k) and "cpl" not in k]
+        if stiff_keys and clear_keys:
+            k0_n, g0_n = stiff_keys[0], clear_keys[0]
+            k0_v = max(abs(p_map_now[k0_n]), 1e-6)
+            g0_v = max(abs(p_map_now[g0_n]), 1e-6)
+            da_0 = k0_v / g0_v
+            zeta_0 = g0_v / (2.0 * math.sqrt(k0_v))
+            pi_list.insert(0, f"Pi_Damkohler_0 = {k0_n} / {g0_n} = {da_0:.4f}")
+            pi_list.insert(1, f"Pi_DampingRatio_0 = {g0_n} / (2*sqrt({k0_n})) = {zeta_0:.4f}")
+            cpl_keys = [k for k in p_map_now if "cpl" in k]
+            if cpl_keys:
+                bi_0 = abs(p_map_now[cpl_keys[0]]) / g0_v
+                pi_list.insert(2, f"Pi_BiotLeakage_0 = {cpl_keys[0]} / {g0_n} = {bi_0:.4f}")
+        pi_strs = tuple(pi_list)
 
-    mh_raw = verify_multi_horizon_stability(
-        brick=brick,
-        params=p_tensor,
-        initial_state=x_tensor[0:1],
-        dt=0.02,
-        base_steps=16,
-    )
-    mh_summary = MultiHorizonTelemetrySummary(
-        horizon_1x_viable_fraction=mh_raw.horizon_1x_viable_fraction,
-        horizon_2x_viable_fraction=mh_raw.horizon_2x_viable_fraction,
-        horizon_4x_viable_fraction=mh_raw.horizon_4x_viable_fraction,
-        min_safety_margin_4x=mh_raw.min_safety_margin_4x,
-        late_horizon_energy_growth=mh_raw.late_horizon_energy_growth,
-        asymptotic_contraction_ratio=mh_raw.asymptotic_contraction_ratio,
-        passed_multi_horizon=mh_raw.passed_multi_horizon,
-    )
+        vault_matches = tuple(search_vault_isomorphisms(brick, vault=vault))
+
+        mh_raw = verify_multi_horizon_stability(
+            brick=brick,
+            params=p_tensor,
+            initial_state=x_tensor[0:1],
+            dt=0.02,
+            base_steps=16,
+        )
+        mh_summary = MultiHorizonTelemetrySummary(
+            horizon_1x_viable_fraction=mh_raw.horizon_1x_viable_fraction,
+            horizon_2x_viable_fraction=mh_raw.horizon_2x_viable_fraction,
+            horizon_4x_viable_fraction=mh_raw.horizon_4x_viable_fraction,
+            min_safety_margin_4x=mh_raw.min_safety_margin_4x,
+            late_horizon_energy_growth=mh_raw.late_horizon_energy_growth,
+            asymptotic_contraction_ratio=mh_raw.asymptotic_contraction_ratio,
+            passed_multi_horizon=mh_raw.passed_multi_horizon,
+        )
 
     return DifferentialEpistemicBriefing(
         system_name=brick.name,

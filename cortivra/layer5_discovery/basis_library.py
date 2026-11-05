@@ -321,31 +321,52 @@ def generate_symbolic_basis_library(
                     if float(torch.linalg.norm(e_diff).item()) <= 1e-12:
                         continue
                     expected_rcpl_unit = (sp_i.unit * sp_j.unit) / (brick.energy_unit * brick.time_unit)
-                    p_name = f"g_onsager_{i}_{j}"
-                    p_spec = ParamSpec(
-                        name=p_name,
-                        unit=expected_rcpl_unit,
-                        default_value=0.1,
-                        min_value=0.0,
-                        max_value=1e6,
-                    )
-                    p_sym = SymbolNode(p_name, expected_rcpl_unit, role="param")
-                    flow_col = torch.zeros((t_steps, state_dim), dtype=torch.float64, device=x.device)
-                    flow_col[:, i] = -e_diff
-                    flow_col[:, j] = e_diff
-                    candidates.append(
-                        CandidateBasisTerm(
-                            term_id=f"onsager_{i}_{j}_const",
-                            expr_node=p_sym,
-                            param_spec=p_spec,
-                            extra_param_specs=(),
-                            thermodynamic_slot="passive_dissipative",
-                            target_key=(i, j),
-                            require_non_negative_coeff=True,
-                            complexity=1,
-                            flow_column=flow_col,
+                    sym_i_node = state_symbols[i]
+                    sym_j_node = state_symbols[j]
+                    diff_ij_node = BinaryOpNode("-", sym_i_node, sym_j_node)
+                    onsager_shapes: list[tuple[str, ExprNode]] = [
+                        ("const", ConstNode(1.0, DIMENSIONLESS)),
+                        ("diff_sq", BinaryOpNode("**", diff_ij_node, ConstNode(2.0, DIMENSIONLESS))),
+                    ]
+                    env_ons = _build_state_env(brick, x, p_base)
+                    for shape_tag, shape_node in onsager_shapes:
+                        shape_u = shape_node.infer_unit()
+                        coeff_unit = expected_rcpl_unit / shape_u
+                        p_name = (
+                            f"g_onsager_{i}_{j}"
+                            if shape_tag == "const"
+                            else f"g_onsager_{i}_{j}_{shape_tag}"
                         )
-                    )
+                        p_spec = ParamSpec(
+                            name=p_name,
+                            unit=coeff_unit,
+                            default_value=0.1,
+                            min_value=0.0,
+                            max_value=1e6,
+                        )
+                        p_sym = SymbolNode(p_name, coeff_unit, role="param")
+                        full_node = (
+                            p_sym
+                            if shape_tag == "const"
+                            else BinaryOpNode("*", p_sym, shape_node)
+                        )
+                        s_vals = shape_node.eval_tensor(env_ons)
+                        flow_col = torch.zeros((t_steps, state_dim), dtype=torch.float64, device=x.device)
+                        flow_col[:, i] = -s_vals * e_diff
+                        flow_col[:, j] = s_vals * e_diff
+                        candidates.append(
+                            CandidateBasisTerm(
+                                term_id=f"onsager_{i}_{j}_{shape_tag}",
+                                expr_node=full_node,
+                                param_spec=p_spec,
+                                extra_param_specs=(),
+                                thermodynamic_slot="passive_dissipative",
+                                target_key=(i, j),
+                                require_non_negative_coeff=True,
+                                complexity=shape_node.tree_complexity(),
+                                flow_column=flow_col,
+                            )
+                        )
 
     # Slot 2: Hamiltonian potential (Delta_H(x), flow = (J - R) * grad(Delta_H))
     elif thermodynamic_slot == "hamiltonian_potential" and not brick.is_matrix_free:
@@ -666,6 +687,22 @@ def generate_symbolic_basis_library(
                         ),
                     )
                     drive_shapes.append((f"boltz_{sym_j.name}", boltz_node, (xh_spec, ks_spec)))
+
+            if state_dim >= 3 and 0 < idx < state_dim - 1:
+                sym_prev = state_symbols[idx - 1]
+                sym_curr = state_symbols[idx]
+                sym_next = state_symbols[idx + 1]
+                if sym_prev.unit == sym_curr.unit and sym_next.unit == sym_curr.unit:
+                    # 1D Discrete Laplacian PDE Stencil: (u_{i-1} - u_i) + (u_{i+1} - u_i) = u_{i-1} - 2*u_i + u_{i+1}
+                    lap_node = BinaryOpNode(
+                        "+",
+                        PrimitiveCallNode("diffusive_flux", (sym_curr, sym_prev, ConstNode(1.0, DIMENSIONLESS))),
+                        PrimitiveCallNode("diffusive_flux", (sym_curr, sym_next, ConstNode(1.0, DIMENSIONLESS))),
+                    )
+                    drive_shapes.append((f"laplacian_1d_{sym_curr.name}", lap_node, ()))
+                    # 1D Central Advection Gradient Stencil: u_{i+1} - u_{i-1}
+                    adv_node = PrimitiveCallNode("diffusive_flux", (sym_prev, sym_next, ConstNode(1.0, DIMENSIONLESS)))
+                    drive_shapes.append((f"advection_1d_{sym_curr.name}", adv_node, ()))
 
             if len(brick.spatial_nodes_3d) >= 2:
                 sym_by_name = {sym.name: sym for sym in state_symbols}

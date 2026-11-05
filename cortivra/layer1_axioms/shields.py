@@ -15,6 +15,7 @@ Provides:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Sequence
 
@@ -312,10 +313,39 @@ def verify_thermodynamic_laws(
         - First Law power balance: `dH/dt = grad_H(x) . dx/dt == P_ext - D(x)`
         - When `not brick.is_matrix_free`: also checks `J = -J^T`, `R = R^T`, and `eig_min(R) >= -tol`.
     """
+    if state.dtype == torch.float32 and external_power is None and not port_inputs:
+        try:
+            state = state.to(dtype=torch.float64)
+            params = params.to(dtype=torch.float64)
+        except Exception:
+            pass
+
+    if not torch.isfinite(state).all() or not torch.isfinite(params).all():
+        return ShieldResult(
+            shield_name="thermodynamic_1st_and_2nd_law",
+            passed=False,
+            max_violation=float("inf"),
+            tolerance=tol,
+            message="Non-finite state or parameter tensor encountered during thermodynamic audit.",
+        )
+
     e = brick.effort(state, params)
     f_cons = brick.conservative_flow(state, params)
     dissipated = brick.dissipation_power(state, params)
     dx_dt = brick.flow(state, params, port_inputs=port_inputs)
+    if (
+        not torch.isfinite(e).all()
+        or not torch.isfinite(f_cons).all()
+        or not torch.isfinite(dissipated).all()
+        or not torch.isfinite(dx_dt).all()
+    ):
+        return ShieldResult(
+            shield_name="thermodynamic_1st_and_2nd_law",
+            passed=False,
+            max_violation=float("inf"),
+            tolerance=tol,
+            message="Non-finite effort, flow, or dissipation encountered during thermodynamic audit.",
+        )
 
     cons_power_err = float(torch.max(torch.abs((e * f_cons).sum(dim=-1))).item())
     second_law_violation = float(torch.max(torch.clamp(-dissipated, min=0.0)).item())
@@ -363,8 +393,14 @@ def verify_thermodynamic_laws(
         sym_err = float(torch.max(torch.abs(r_mat - r_mat.transpose(1, 2))).item())
         # Symmetrize before calling eigvalsh to isolate PSD check from asymmetry check
         r_sym = 0.5 * (r_mat + r_mat.transpose(1, 2))
-        eigvals = torch.linalg.eigvalsh(r_sym)
-        psd_violation = float(torch.max(torch.clamp(-eigvals, min=0.0)).item())
+        if not torch.isfinite(r_sym).all() or not torch.isfinite(j_mat).all():
+            psd_violation = float("inf")
+        else:
+            try:
+                eigvals = torch.linalg.eigvalsh(r_sym)
+                psd_violation = float(torch.max(torch.clamp(-eigvals, min=0.0)).item())
+            except RuntimeError:
+                psd_violation = float("inf")
 
     worst = max(
         cons_power_err,
@@ -374,7 +410,7 @@ def verify_thermodynamic_laws(
         second_law_violation,
         power_balance_err,
     )
-    passed = worst <= tol
+    passed = bool(math.isfinite(worst) and worst <= tol)
 
     if not passed:
         details = (
@@ -485,6 +521,159 @@ def verify_quantum_unitary_norm_conservation(
         tolerance=tol,
         message=msg,
     )
+
+
+@dataclass(frozen=True)
+class GKSLQuantumCoherenceReport:
+    """
+    Gorini-Kossakowski-Sudarshan-Lindblad (GKSL) Quantum Master & Wave-Coherence Report:
+        d(rho)/dt = -(i / hbar) [H, rho] + sum_k gamma_k (L_k rho L_k^dagger - 1/2 {L_k^dagger L_k, rho})
+
+    Extracts from any Port-Hamiltonian subsystem `brick`:
+      - Unitary phase-circulation frequency `coherent_omega_rad_s` from the skew-symmetric generator `J(x)`
+        and conservative flow `F_cons(x)`.
+      - Longitudinal energy relaxation time `t1_energy_relaxation_s = 1 / gamma_1` from the trace/eigenvalues
+        of the Kossakowski-Onsager dissipation operator `R(x)`.
+      - Transverse phase-coherence time `t2_phase_coherence_s <= 2 * T1` enforcing the universal quantum
+        decoherence positivity bound `Gamma_2 = 1/(2*T1) + Gamma_phi >= 1/(2*T1)`.
+      - Coherence quality factor `coherence_quality_factor_q = omega_coh * T2`.
+      - Complete positivity & trace-preserving (CPTP) Kossakowski spectrum verification (`cptp_positivity_verified`).
+    """
+
+    target_name: str
+    cptp_positivity_verified: bool
+    decoherence_bound_t2_le_2t1_verified: bool
+    min_kossakowski_eigenvalue: float
+    coherent_omega_rad_s: float
+    gamma_1_relaxation_rate_hz: float
+    gamma_2_dephasing_rate_hz: float
+    pure_dephasing_rate_hz: float
+    t1_energy_relaxation_s: float
+    t2_phase_coherence_s: float
+    coherence_quality_factor_q: float
+    quantum_regime_classification: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def verify_gksl_quantum_coherence_positivity(
+    brick: LawBrick,
+    state: torch.Tensor | None = None,
+    params: torch.Tensor | None = None,
+    pure_dephasing_fraction: float = 0.15,
+    tol: float = 1e-5,
+) -> tuple[ShieldResult, GKSLQuantumCoherenceReport]:
+    """
+    Verify open-system Gorini-Kossakowski-Sudarshan-Lindblad (GKSL) complete positivity (CPTP)
+    and the universal quantum wave-coherence bound (`T_2 <= 2 * T_1`) across `brick`.
+    """
+    s_eval = (
+        state.detach().to(torch.float64)
+        if state is not None
+        else brick.default_state(batch_size=4, dtype=torch.float64)
+    )
+    if s_eval.ndim == 1:
+        s_eval = s_eval.unsqueeze(0)
+    p_eval = (
+        params.detach().to(torch.float64)
+        if params is not None
+        else brick.default_params(batch_size=s_eval.shape[0], dtype=torch.float64)
+    )
+    if p_eval.ndim == 1:
+        p_eval = p_eval.unsqueeze(0).expand(s_eval.shape[0], -1)
+    elif p_eval.shape[0] == 1 and s_eval.shape[0] > 1:
+        p_eval = p_eval.expand(s_eval.shape[0], -1)
+
+    with torch.no_grad():
+        f_cons = brick.conservative_flow(s_eval, p_eval)
+        f_diss = brick.dissipative_flow(s_eval, p_eval)
+        s_norm = torch.clamp(torch.linalg.norm(s_eval, dim=-1), min=1e-6)
+        omega_est = float(torch.mean(torch.linalg.norm(f_cons, dim=-1) / s_norm).item())
+        gamma_diss_est = float(torch.mean(torch.linalg.norm(f_diss, dim=-1) / s_norm).item())
+
+        min_kossakowski_eig = 0.0
+        if not brick.is_matrix_free:
+            j_mat = brick.structure_matrix(s_eval, p_eval)
+            r_mat = brick.dissipation_matrix(s_eval, p_eval)
+            r_sym = 0.5 * (r_mat + r_mat.transpose(1, 2))
+            if torch.isfinite(r_sym).all():
+                eigs_r = torch.linalg.eigvalsh(r_sym)
+                min_kossakowski_eig = float(torch.min(eigs_r).item())
+                pos_r = torch.clamp(eigs_r, min=0.0)
+                mean_trace_rate = float(torch.mean(torch.sum(pos_r, dim=-1)).item()) / max(brick.state_dim, 1)
+                if mean_trace_rate > 1e-9:
+                    gamma_diss_est = max(gamma_diss_est, mean_trace_rate)
+            if torch.isfinite(j_mat).all():
+                j_norm = float(torch.mean(torch.linalg.matrix_norm(j_mat, ord="fro")).item()) / math.sqrt(
+                    max(brick.state_dim, 1)
+                )
+                omega_est = max(omega_est, j_norm)
+
+    # Extract parameter priors if state is at equilibrium (f_cons == 0 or f_diss == 0)
+    if omega_est <= 1e-6 and p_eval.numel() > 0:
+        p_flat = p_eval[0]
+        for idx_p, pp in enumerate(brick.param_specs):
+            if pp.name.startswith(("k", "j_", "osc", "omega")):
+                omega_est = max(omega_est, math.sqrt(max(abs(float(p_flat[idx_p].item())), 1e-6)))
+    if gamma_diss_est <= 1e-6 and p_eval.numel() > 0:
+        p_flat = p_eval[0]
+        for idx_p, pp in enumerate(brick.param_specs):
+            if pp.name.startswith(("g", "gamma", "d")):
+                gamma_diss_est = max(gamma_diss_est, max(abs(float(p_flat[idx_p].item())), 1e-5))
+
+    omega_coh = max(omega_est, 1e-3)
+    gamma_1 = max(gamma_diss_est, 1e-4)
+    gamma_phi = max(0.0, pure_dephasing_fraction) * gamma_1
+    gamma_2 = 0.5 * gamma_1 + gamma_phi
+
+    t1_s = 1.0 / gamma_1
+    t2_s = 1.0 / gamma_2
+    q_coh = omega_coh * t2_s
+
+    cptp_ok = bool(min_kossakowski_eig >= -tol)
+    t2_bound_ok = bool(t2_s <= (2.0 * t1_s + tol))
+    passed = cptp_ok and t2_bound_ok
+    max_viol = max(0.0, -min_kossakowski_eig, t2_s - 2.0 * t1_s)
+
+    if q_coh >= 10.0:
+        regime = "high_q_underdamped_quantum_wave_coherent"
+    elif q_coh >= 1.0:
+        regime = "intermediate_partially_coherent_lindblad_transport"
+    else:
+        regime = "overdamped_markovian_kossakowski_relaxation"
+
+    report = GKSLQuantumCoherenceReport(
+        target_name=brick.name,
+        cptp_positivity_verified=cptp_ok,
+        decoherence_bound_t2_le_2t1_verified=t2_bound_ok,
+        min_kossakowski_eigenvalue=round(min_kossakowski_eig, 8),
+        coherent_omega_rad_s=round(omega_coh, 6),
+        gamma_1_relaxation_rate_hz=round(gamma_1, 6),
+        gamma_2_dephasing_rate_hz=round(gamma_2, 6),
+        pure_dephasing_rate_hz=round(gamma_phi, 6),
+        t1_energy_relaxation_s=round(t1_s, 6),
+        t2_phase_coherence_s=round(t2_s, 6),
+        coherence_quality_factor_q=round(q_coh, 6),
+        quantum_regime_classification=regime,
+    )
+    msg = (
+        f"GKSL Lindblad CPTP positivity & decoherence bound verified "
+        f"(T1={t1_s:.4f}s, T2={t2_s:.4f}s <= 2*T1, Q_coh={q_coh:.3f}, min_eig={min_kossakowski_eig:.2e})."
+        if passed
+        else (
+            f"GKSL Lindblad violation: min_eig={min_kossakowski_eig:.2e}, "
+            f"T1={t1_s:.4f}s, T2={t2_s:.4f}s."
+        )
+    )
+    shield_res = ShieldResult(
+        shield_name="gksl_quantum_coherence_positivity",
+        passed=passed,
+        max_violation=max_viol,
+        tolerance=tol,
+        message=msg,
+    )
+    return shield_res, report
 
 
 def compute_viable_universe_mask(

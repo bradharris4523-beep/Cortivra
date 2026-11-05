@@ -42,6 +42,7 @@ from cortivra.layer3_compiler.symbolic_compiler import (
     build_symbol_table,
     compile_residual_patch_brick,
     compile_symbolic_system,
+    repair_and_unify_symbolic_spec_dict,
 )
 
 __all__ = [
@@ -60,6 +61,7 @@ __all__ = [
     "build_symbol_table",
     "compile_symbolic_system",
     "compile_residual_patch_brick",
+    "repair_and_unify_symbolic_spec_dict",
     "CompartmentGeometry",
     "DiscretizedCompartmentGraph",
     "HeterogeneousCompartmentTransportBrick",

@@ -422,8 +422,11 @@ class MultiFieldReactionDiffusionPDEBrick(LawBrick):
                 raise ValueError(
                     f"Expected {num_species} reaction_exprs, got {len(reaction_exprs)}."
                 )
+            rxn_sym_units: dict[str, Unit] = {s_name: state_unit for s_name in self.species_names}
+            for p_spec in self._reaction_param_specs:
+                rxn_sym_units[p_spec.name] = p_spec.unit
             self._reaction_nodes = tuple(
-                parse_symbolic_expr(expr) if isinstance(expr, str) else expr
+                parse_symbolic_expr(expr, rxn_sym_units) if isinstance(expr, str) else expr
                 for expr in reaction_exprs
             )
 

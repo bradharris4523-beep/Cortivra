@@ -60,6 +60,7 @@ coverage.xml
 *.npz
 wasm_cache/
 runs/
+logs/
 wandb/
 outputs/
 tmp/

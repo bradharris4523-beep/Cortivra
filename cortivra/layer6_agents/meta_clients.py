@@ -4,10 +4,11 @@ Multi-provider AI inference client (`cortivra.layer6_agents.meta_clients`).
 
 from __future__ import annotations
 
-import ast
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -15,10 +16,44 @@ from typing import Any, Literal
 import httpx
 from dotenv import load_dotenv
 
-from cortivra.layer1_axioms.units import DIMENSIONLESS, Unit, parse_unit
-from cortivra.layer3_compiler.ast_nodes import SymbolNode, parse_symbolic_expr
 
-ProviderName = Literal["fireworks", "baseten", "meta", "local", "epistemic_policy"]
+def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
+    """
+    Extract and parse the first valid JSON object from an LLM response string,
+    handling markdown code fences or leading/trailing commentary.
+    """
+    text = raw_text.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fence_match:
+        try:
+            parsed = json.loads(fence_match.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if 0 <= first_brace < last_brace:
+        try:
+            parsed = json.loads(text[first_brace : last_brace + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    return None
+
+ProviderName = Literal["fireworks", "baseten", "meta", "local"]
 AgentRole = Literal["muse_wonder", "muse_spark", "muse_spark_open", "muse_glimmer"]
 
 _PLACEHOLDER_KEYS = {
@@ -166,48 +201,60 @@ ROLE_SYSTEM_PROMPTS: dict[AgentRole, str] = {
         "Return strictly valid JSON with keys 'falsification_survived' (bool) and 'red_team_verdict' (str)."
     ),
     "muse_glimmer": (
-        "You are Muse Glimmer, the mathematical chronicler of Cortivra. "
+        "You are Muse Glimmer, the mathematical chronicler and physical realization architect of Cortivra. "
         "Synthesize the verified differential telemetry, discovered symbolic operators, counterfactual "
-        "parameter interventions, multi-horizon (1x/2x/4x) safety margins, Lie-derivative conservation "
-        "invariants, and cross-domain LawVault operator isomorphisms into a concise JSON object with "
-        "keys 'executive_summary', 'conserved_quantities', and 'cross_domain_isomorphisms'."
+        "parameter interventions (including Ashby-Eyring multiplicative factorization alpha = alpha_mat * alpha_geom * alpha_act), "
+        "multi-horizon (1x/2x/4x) safety margins, Lie-derivative conservation invariants, and cross-domain "
+        "LawVault operator isomorphisms into a concise JSON object with keys: "
+        "'executive_summary' (str: 2-3 dense quantitative sentences, <= 75 words), 'conserved_quantities' (list[str]), "
+        "'cross_domain_isomorphisms' (list[str]), and 'physical_realization_protocol' (dict with keys: 'bottleneck_lever', "
+        "'realizability_tier', 'material_or_molecular_mechanism', 'micro_geometric_architecture', "
+        "'active_feedback_or_firmware_role', and 'step_by_step_verification_protocol' (list of 4 concise 1-sentence steps)). "
+        "Keep the entire JSON output compact (< 400 tokens) with zero thinking prose."
     ),
 }
 
 WORLD_MODEL_SYNTHESIS_PROTOCOL: str = (
-    "\nUNIVERSAL N-COMPARTMENT CAUSAL BLAST-RADIUS & BYSTANDER SHIELD PROTOCOL FOR 'synthesize_world_model' (ZERO DOMAIN ASSUMPTIONS):\n"
+    "\nUNIVERSAL N-COMPARTMENT CAUSAL BLAST-RADIUS & BYSTANDER SHIELD PROTOCOL FOR 'synthesize_world_model' (DOMAIN-AUTHENTIC NONLINEAR PHYSICS):\n"
     "CRITICAL EFFICIENCY & ANTI-TEMPLATE RULE: Do NOT restate these rules or write long prose in your thinking. "
-    "Immediately choose N >= 5 coupled state variables (5 to 7 compartments) covering the full causal blast radius, and output the JSON object directly. "
-    "AUTONOMOUS FAILURE-MODE & BYSTANDER DEDUCTION: Even when the user's prompt is a short, naive goal that does NOT mention any side effects or bystanders to avoid, "
-    "you MUST autonomously deduce the real physical failure modes, local stresses, and vulnerable neighboring bystander compartments in that domain and construct all N >= 5 compartments with domain-authentic names. "
-    "NEVER assign identical default_value numbers across k_1..k_N, g_1..g_N, or u_1..u_N; every compartment MUST have a distinct, physically authentic stiffness, relaxation rate, and drive reflecting its real physical timescale and capacity in this domain.\n"
+    "Use concise snake_case state names (<= 18 chars) and output the compact JSON object immediately (< 1200 tokens). "
+    "If 'observed_telemetry_columns' is provided in the prompt payload, you MUST name the leading state variables in 'state_specs' using those exact column names. "
+    "When the user asks an open-ended engineering, medical, or control question without restricting the state dimension, choose N = 5 coupled state variables (5 compartments) covering the full causal blast radius, and output the JSON object directly. "
+    "When the user explicitly asks to discover/identify the governing equations of an uploaded K-column dataset or specifies an exact K-state canonical mathematical system, you may use the exact K state variables of that dataset/system.\n"
+    "AUTONOMOUS FAILURE-MODE & DOMAIN-AUTHENTIC NONLINEARITY MANDATE: "
+    "You MUST deduce the real physical failure modes, local stresses, and vulnerable neighboring bystander compartments in that specific scientific domain. "
+    "NEVER reuse generic placeholder numbers like [2.85, 1.45, 0.72, 1.92, 3.4] or [0.42, 1.65, 0.88, 0.31, 1.15]; every problem MUST have unique, domain-authentic stiffnesses, relaxation rates, and nonlinear interaction laws reflecting its real physical mechanism:\n"
+    "  - Quantum / Superconductivity / Condensed Matter: Include quartic Ginzburg-Landau condensate potential ('0.06 * k_1 * x_1**4') and biquadratic competing order-parameter coupling ('0.12 * k_2 * x_1**2 * x_2**2') in 'hamiltonian_expr', plus Josephson/phase skew routing.\n"
+    "  - Fusion / Plasma / MHD: Include anharmonic pedestal pressure energy ('0.05 * k_1 * x_1**4') in 'hamiltonian_expr', strong E x B zonal-shear skew-symmetric exchange ('j_osc'), and shear-suppressed transport.\n"
+    "  - Prebiotic Chemistry / Origin of Life / Catalysis: Include bimolecular template-substrate hybridization & autocatalytic replication kinetics ('u_1 * x_1 * x_3 / (0.45 + x_3 + 0.35 * x_1**2)') and chelator-shielded hydrolysis.\n"
+    "  - Oncology / Immunology: Include predator-prey effector-tumor cytolytic kinetics modulated by hypoxic adenosine/TOX exhaustion and peripheral Treg tolerance.\n"
+    "  - Neurobiology / Proteostasis: Include cooperative oligomer nucleation-fragmentation, chaperone/autophagic clearance, and microglial NLRP3 threshold gating.\n"
     "Construct a nonlinear N-state Port-Hamiltonian dynamical system dx/dt = (J(x) - R(x)) grad H(x) + u(x) with N >= 5:\n"
     "  1. AXIOM I, II & III (N >= 5 Coupled Physical States in 'state_specs', all with 'unit': '1'):\n"
     "     - State 0 (Primary Target Order Parameter x_1): primary physical mechanism targeted by the hypothesis "
     "(choose domain-authentic degraded 'default_value' in [1.8, 4.2], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'primary_target').\n"
-    "     - State 1 (Local Stress / Entropic Wear x_2): direct local thermodynamic, oxidative, or mechanical stress inside the primary compartment "
+    "     - State 1 (Local Stress / Competing Mode x_2): direct local thermodynamic, oxidative, stripe, or mechanical stress inside the primary compartment "
     "(choose 'default_value' in [0.7, 1.5], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'local_stress').\n"
     "     - State 2 (Energetic / Resource Supply Reservoir x_3): energetic carrier, fuel manifold, or potential reservoir feeding the system "
     "(choose 'default_value' in [0.6, 1.4], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'energy_reservoir').\n"
-    "     - State 3 (Co-Located Bystander Compartment x_4): neighboring cell type, adjacent mechanical component (e.g. bearing/seal/adjacent tissue), "
+    "     - State 3 (Co-Located Bystander Compartment x_4): neighboring cell type, adjacent mechanical component, "
     "or parallel subsystem sharing the physical medium that must be shielded from off-target friendly fire "
     "(choose 'default_value' in [0.8, 1.3], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'co_located_bystander').\n"
     "     - State 4 (Downstream Functional Receiver x_5): downstream organ, neural pathway, structural frame, or exhaust stage receiving output flux from State 0 "
     "(choose 'default_value' in [0.8, 1.3], 'homeostatic_min': 0.05, 'homeostatic_max': 8.0, 'causal_role': 'downstream_receiver').\n"
-    "     - States 5..N-1 (Optional additional coupled bystanders or downstream stages x_6..x_N if the causal network requires N > 5).\n"
     "  2. AXIOM III (Heterogeneous Domain-Specific Parameters in 'param_specs'):\n"
-    "     - Quadratic stiffnesses in H: k_1 (tunable: true), k_2 (tunable: true), k_3..k_N (tunable: false) with 'unit': '1', min_value 0.1, max_value 10.0, and DISTINCT 'default_value' in [0.5, 3.8] reflecting each compartment's physical rigidity/capacitance.\n"
-    "     - Dissipation/clearance rates: g_1 (tunable: true), g_2 (tunable: true), g_3..g_N (tunable: false) with 'unit': '1/s', min_value 0.05, max_value 10.0, and DISTINCT 'default_value' in [0.25, 2.2] reflecting each compartment's physical turnover/damping rate.\n"
+    "     - Stiffnesses in H: k_1 (tunable: true), k_2 (tunable: true), k_3..k_N (tunable: false) with 'unit': '1', min_value 0.1, max_value 10.0, and DISTINCT domain-specific 'default_value' in [0.5, 3.8].\n"
+    "     - Dissipation/clearance rates: g_1 (tunable: true), g_2 (tunable: true), g_3..g_N (tunable: false) with 'unit': '1/s', min_value 0.05, max_value 10.0, and DISTINCT domain-specific 'default_value' in [0.25, 2.2].\n"
     "     - Onsager cross-coupling rate: g_cpl (tunable: true, 'unit': '1/s', choose 'default_value' in [0.08, 0.45], min_value: 0.0, max_value: 5.0).\n"
-    "     - Conservative skew-symmetric routing rate (include for oscillatory/mechanical/wave/feedback systems): j_osc (tunable: true, 'unit': '1/s', 'default_value' in [0.05, 0.6], min_value: 0.0, max_value: 5.0).\n"
+    "     - Conservative skew-symmetric routing rate: j_osc (tunable: true, 'unit': '1/s', 'default_value' in [0.05, 0.6], min_value: 0.0, max_value: 5.0).\n"
     "     - Basal/active drives: u_1 (tunable: true), u_2..u_N (tunable: false) with 'unit': '1/s', min_value 0.0, max_value 10.0, and DISTINCT 'default_value' in [0.3, 2.4].\n"
-    "  3. AXIOM IV (Nonlinear Mechanistic Kinetics & N-Node 3D Compartment Geometry):\n"
-    "     - 'name': descriptive snake_case model name, 'domain': scientific domain string, 'time_unit': 's', 'energy_unit': '1'\n"
-    "     - 'hamiltonian_expr': sum of '0.5 * k_i * x_i**2' across all N states (using your exact N state and stiffness names)\n"
-    "     - 'dissipation_diag_exprs': length-N list with domain-specific nonlinear state-modulated clearance on State 0 and State 1 (choose cooperativity power 2 or 3 and coupling strength matching the physics)\n"
+    "  3. AXIOM IV (Domain-Specific Nonlinear Mechanistic Kinetics & N-Node 3D Compartment Geometry):\n"
+    "     - 'name': descriptive snake_case model name, 'domain': specific scientific domain string (e.g. 'neurobiology', 'immunology_oncology', 'fusion_plasma_physics', 'prebiotic_chemistry', 'quantum_condensed_matter'), 'time_unit': 's', 'energy_unit': '1'\n"
+    "     - 'hamiltonian_expr': domain-specific energy functional combining quadratic terms '0.5 * k_i * x_i**2' with domain-appropriate quartic ('0.05 * k_1 * x_1**4') or biquadratic cross-potential ('0.08 * k_2 * x_1**2 * x_2**2') terms\n"
+    "     - 'dissipation_diag_exprs': length-N list with domain-specific nonlinear state-modulated clearance/damping on State 0 and State 1\n"
     "     - 'dissipation_coupling_exprs': symmetric Onsager cross-dissipation dict coupling State 0 across the blast radius {'0,1': '...', '0,2': '...', '0,3': '...', '0,4': '...'}\n"
-    "     - 'skew_routing_exprs': optional skew-symmetric conservative energy exchange dict e.g. {'0,1': 'j_osc'} when gyroscopic or oscillatory feedback is present\n"
-    "     - 'external_drive_exprs': length-N list with Michaelis-Menten energetic saturation & Hill feedback inhibition on State 0 (choose saturation constant and Hill exponent 2, 3, or 4 matching the physical mechanism)\n"
+    "     - 'skew_routing_exprs': skew-symmetric conservative energy exchange dict e.g. {'0,1': 'j_osc', '0,2': '0.5 * j_osc'}\n"
+    "     - 'external_drive_exprs': length-N list with domain-specific nonlinear reaction/drive kinetics on State 0\n"
     "     - 'spatial_nodes_3d': list of N 3D compartments (one per state) [{'node_id': str, 'fixed_position_m': [x, y, z], "
     "'volume_m3': float, 'radius_m': float, 'associated_state_names': [str]}].\n"
     "  - Allowed algebraic operators: '+', '-', '*', '/', '**'. All symbols in expressions MUST be in 'state_specs' or 'param_specs'.\n"
@@ -272,985 +319,6 @@ class LLMInferenceResponse:
     failover_attempts: int = 0
 
 
-def _extract_json_object(text: str) -> dict[str, Any] | None:
-    """
-    Extract the first valid JSON object from raw model output (handling markdown code fences).
-    """
-    stripped = text.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL)
-    if fence_match:
-        try:
-            obj = json.loads(fence_match.group(1))
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = stripped[start : end + 1]
-        try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-    return None
-
-
-def _split_top_level_additive_terms(expr_str: str) -> list[str]:
-    """
-    Split an algebraic expression into top-level additive (`+` / `-`) sub-expressions
-    using Python's AST so each additive term's SI dimension can be solved independently.
-    """
-    try:
-        tree = ast.parse(expr_str.strip(), mode="eval")
-    except SyntaxError:
-        return [expr_str]
-
-    terms: list[str] = []
-
-    def _collect(node: ast.AST) -> None:
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
-            _collect(node.left)
-            _collect(node.right)
-        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-            _collect(node.operand)
-        else:
-            terms.append(ast.unparse(node))
-
-    _collect(tree.body)
-    return terms if terms else [expr_str]
-
-
-def _solve_expression_dimensional_constraints(
-    expr_str: str,
-    target_unit: Unit,
-    state_unit_map: dict[str, Unit],
-    param_by_name: dict[str, dict[str, Any]],
-) -> None:
-    """
-    Use Layer 3's symbolic AST (`parse_symbolic_expr`) to infer and repair parameter SI units
-    so every additive term in `expr_str` matches `target_unit.dimension`.
-    """
-    if not expr_str or expr_str.strip() in ("0", "0.0"):
-        return
-
-    for term_str in _split_top_level_additive_terms(expr_str):
-        if term_str.strip() in ("0", "0.0"):
-            continue
-        sym_table: dict[str, SymbolNode] = {}
-        for s_name, s_u in state_unit_map.items():
-            sym_table[s_name] = SymbolNode(s_name, s_u, role="state")
-        for p_name, p_info in param_by_name.items():
-            p_u = parse_unit(str(p_info.get("unit", "1")))
-            sym_table[p_name] = SymbolNode(p_name, p_u, role="param")
-
-        try:
-            parsed_node = parse_symbolic_expr(term_str, symbol_table=sym_table)
-            inferred_u = parsed_node.infer_unit()
-            if inferred_u.dimension == target_unit.dimension:
-                continue
-        except Exception:
-            pass
-
-        referenced_params = [
-            p_name
-            for p_name in param_by_name
-            if re.search(rf"\b{re.escape(p_name)}\b", term_str)
-        ]
-        for p_cand in referenced_params:
-            probe_table = dict(sym_table)
-            probe_table[p_cand] = SymbolNode(p_cand, DIMENSIONLESS, role="param")
-            try:
-                probe_node = parse_symbolic_expr(term_str, symbol_table=probe_table)
-                rest_unit = probe_node.infer_unit()
-                req_dim = (target_unit / rest_unit).dimension
-                req_unit_str = req_dim.format_si()
-                verify_table = dict(sym_table)
-                verify_table[p_cand] = SymbolNode(p_cand, parse_unit(req_unit_str), role="param")
-                verify_u = parse_symbolic_expr(term_str, symbol_table=verify_table).infer_unit()
-                if verify_u.dimension == target_unit.dimension:
-                    param_by_name[p_cand]["unit"] = req_unit_str
-                    break
-            except Exception:
-                continue
-
-
-class MathematicalEpistemicPolicy:
-    """
-    First-principles mathematical reasoning policy that parses the JSON
-    `DifferentialEpistemicBriefing` and compiler diagnostics inside `user_prompt`
-    to emit valid JSON tool actions when external network keys are not yet populated.
-    """
-
-    @staticmethod
-    def infer_response(request: LLMInferenceRequest) -> tuple[str, dict[str, Any]]:
-        payload = _extract_json_object(request.user_prompt) or {}
-        task_type = payload.get("task_type", "select_next_action")
-
-        if task_type == "symbolic_self_repair":
-            return MathematicalEpistemicPolicy._handle_symbolic_repair(payload)
-        if task_type == "synthesize_world_model":
-            return MathematicalEpistemicPolicy._handle_world_model_synthesis(payload)
-        if task_type == "audit_operator_or_intervention":
-            return MathematicalEpistemicPolicy._handle_spark_audit(payload)
-        if task_type == "adversarial_red_team_review":
-            return MathematicalEpistemicPolicy._handle_red_team_review(payload)
-        if task_type == "synthesize_dossier_narrative":
-            return MathematicalEpistemicPolicy._handle_dossier_narrative(payload)
-        return MathematicalEpistemicPolicy._handle_action_selection(payload)
-
-    @staticmethod
-    def _handle_world_model_synthesis(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """
-        Synthesize a dimensionally homogeneous Port-Hamiltonian `SymbolicSystemSpec` dictionary,
-        `target_state_objective`, `inverse_mode`, and optional `unmodeled_anomaly_patch` from an
-        open-ended natural-language scientific hypothesis across any physical, chemical,
-        biological, neuroscience, aerospace, thermodynamic, or quantum domain.
-        """
-        question = str(payload.get("question", "")).strip()
-        q_lc = question.lower()
-        domain = str(payload.get("domain", "multiphysics")).strip() or "multiphysics"
-
-        inv_mode = "counterfactual_intervention"
-        anomaly_patch: dict[str, Any] | None = None
-
-        is_locked_invention = any(
-            k in q_lc
-            for k in (
-                "invent",
-                "catalyst",
-                "synthetic feedback",
-                "locked",
-                "irreversible",
-                "unactuated",
-                "frozen",
-                "closed-loop controller",
-                "gene circuit",
-            )
-        )
-        is_anomaly_discovery = any(
-            k in q_lc
-            for k in (
-                "anomaly",
-                "unexplained",
-                "missing law",
-                "missing mechanism",
-                "discover",
-                "faster than linear",
-                "nonlinear decay",
-                "why is",
-                "unmodeled",
-            )
-        )
-
-        if is_locked_invention:
-            spec_dict: dict[str, Any] = {
-                "name": "synthesized_locked_degenerative_pathway",
-                "domain": domain if domain != "multiphysics" else "biochemistry_and_synthetic_biology",
-                "time_unit": "s",
-                "energy_unit": "1",
-                "state_specs": [
-                    {
-                        "name": "x_metabolite",
-                        "unit": "1",
-                        "default_value": 0.4,
-                        "homeostatic_min": 0.0,
-                        "homeostatic_max": 10.0,
-                        "hard_min": 0.0,
-                    },
-                ],
-                "param_specs": [
-                    {
-                        "name": "k_degrade",
-                        "unit": "1/s",
-                        "default_value": 1.0,
-                        "min_value": 0.1,
-                        "max_value": 5.0,
-                        "tunable": False,
-                    },
-                ],
-                "hamiltonian_expr": "0.5 * (x_metabolite**2)",
-                "dissipation_diag_exprs": ["k_degrade"],
-                "external_drive_exprs": ["0.0"],
-                "spatial_nodes_3d": [
-                    {
-                        "node_id": "cytoplasmic_reactor_core_3d",
-                        "fixed_position_m": [0.0, 0.0, 0.0],
-                        "volume_m3": 4.188e-15,
-                        "radius_m": 1.0e-5,
-                        "associated_state_names": ["x_metabolite"],
-                    }
-                ],
-            }
-            target_obj: dict[str, float] = {"x_metabolite": 2.0}
-            inv_mode = "symbolic_mechanism_invention"
-        elif any(
-            k in q_lc
-            for k in ("orbit", "space", "gravity", "neptune", "planet", "3d", "thrust", "fuel", "satellite", "kepler")
-        ):
-            spec_dict = {
-                "name": "synthesized_3d_orbital_energetics_system",
-                "domain": domain if domain != "multiphysics" else "astrophysics_and_aerospace",
-                "time_unit": "s",
-                "energy_unit": "J",
-                "state_specs": [
-                    {"name": "rx", "unit": "m", "default_value": 2.0, "homeostatic_min": -20.0, "homeostatic_max": 20.0},
-                    {"name": "ry", "unit": "m", "default_value": 1.5, "homeostatic_min": -20.0, "homeostatic_max": 20.0},
-                    {"name": "rz", "unit": "m", "default_value": 0.8, "homeostatic_min": -20.0, "homeostatic_max": 20.0},
-                ],
-                "param_specs": [
-                    {"name": "k_grav", "unit": "J/m**2", "default_value": 1.5, "min_value": 0.1, "max_value": 20.0, "tunable": True},
-                    {"name": "g_drag", "unit": "m**2/(J*s)", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": True},
-                    {"name": "u_thrust_x", "unit": "m/s", "default_value": 0.9, "min_value": -10.0, "max_value": 10.0, "tunable": True},
-                ],
-                "hamiltonian_expr": "0.5 * k_grav * (rx**2 + ry**2 + rz**2)",
-                "dissipation_diag_exprs": ["g_drag", "g_drag", "g_drag"],
-                "skew_routing_exprs": {"0,1": "0.25 * g_drag"},
-                "external_drive_exprs": ["u_thrust_x", "0.0", "0.0"],
-                "spatial_nodes_3d": [
-                    {
-                        "node_id": "craft_3d",
-                        "position_state_names": ["rx", "ry", "rz"],
-                        "fixed_position_m": [2.0, 1.5, 0.8],
-                        "volume_m3": 1.0,
-                        "radius_m": 0.5,
-                        "associated_state_names": ["rx", "ry", "rz"],
-                    },
-                ],
-            }
-            target_obj = {"rx": 0.5}
-        elif any(
-            k in q_lc
-            for k in (
-                "neuron",
-                "membrane",
-                "voltage",
-                "depolariz",
-                "hyperpolariz",
-                "calcium",
-                "ion channel",
-                "ionic",
-                "channel",
-                "synap",
-                "cardiac",
-                "pacemaker",
-                "cochlear",
-                "excitotoxic",
-            )
-        ):
-            spec_dict = {
-                "name": "synthesized_bioelectrical_calcium_homeostasis_system",
-                "domain": domain if domain != "multiphysics" else "electrophysiology_and_neurobiology",
-                "time_unit": "s",
-                "energy_unit": "J",
-                "state_specs": [
-                    {
-                        "name": "V_m",
-                        "unit": "V",
-                        "default_value": 2.2,
-                        "homeostatic_min": -8.0,
-                        "homeostatic_max": 8.0,
-                    },
-                    {
-                        "name": "Ca_cyt",
-                        "unit": "mol/m**3",
-                        "default_value": 1.15,
-                        "homeostatic_min": 0.05,
-                        "homeostatic_max": 6.0,
-                        "hard_min": 0.0,
-                    },
-                ],
-                "param_specs": [
-                    {
-                        "name": "k_cap",
-                        "unit": "J/V**2",
-                        "default_value": 1.0,
-                        "min_value": 0.2,
-                        "max_value": 10.0,
-                        "tunable": False,
-                    },
-                    {
-                        "name": "k_ca_buf",
-                        "unit": "J*m**6/mol**2",
-                        "default_value": 1.0,
-                        "min_value": 0.2,
-                        "max_value": 10.0,
-                        "tunable": False,
-                    },
-                    {
-                        "name": "g_leak_v",
-                        "unit": "V**2/(J*s)",
-                        "default_value": 1.0,
-                        "min_value": 0.1,
-                        "max_value": 10.0,
-                        "tunable": False,
-                    },
-                    {
-                        "name": "g_pump_ca",
-                        "unit": "mol**2/(J*m**6*s)",
-                        "default_value": 1.2,
-                        "min_value": 0.1,
-                        "max_value": 10.0,
-                        "tunable": False,
-                    },
-                    {
-                        "name": "u_shared_drive",
-                        "unit": "V/s",
-                        "default_value": 1.0,
-                        "min_value": 0.0,
-                        "max_value": 6.0,
-                        "tunable": True,
-                    },
-                    {
-                        "name": "u_selective_k",
-                        "unit": "V/s",
-                        "default_value": 1.2,
-                        "min_value": -4.0,
-                        "max_value": 6.0,
-                        "tunable": True,
-                    },
-                    {
-                        "name": "c_ca_couple",
-                        "unit": "mol/(m**3*V)",
-                        "default_value": 1.2,
-                        "min_value": 0.1,
-                        "max_value": 5.0,
-                        "tunable": False,
-                    },
-                ],
-                "hamiltonian_expr": "0.5 * k_cap * (V_m**2) + 0.5 * k_ca_buf * (Ca_cyt**2)",
-                "dissipation_diag_exprs": ["g_leak_v", "g_pump_ca"],
-                "external_drive_exprs": ["u_shared_drive + u_selective_k", "c_ca_couple * u_shared_drive"],
-                "spatial_nodes_3d": [
-                    {
-                        "node_id": "somatic_membrane_shell_3d",
-                        "fixed_position_m": [0.0, 0.0, 0.0],
-                        "volume_m3": 4.188e-15,
-                        "radius_m": 1.0e-5,
-                        "associated_state_names": ["V_m"],
-                    },
-                    {
-                        "node_id": "cytosolic_calcium_microdomain_3d",
-                        "fixed_position_m": [2.5e-6, 0.0, 0.0],
-                        "volume_m3": 5.236e-16,
-                        "radius_m": 5.0e-6,
-                        "associated_state_names": ["Ca_cyt"],
-                    },
-                ],
-            }
-            target_obj = {"V_m": 0.5}
-            if is_anomaly_discovery:
-                anomaly_patch = {
-                    "thermodynamic_mode": "passive_dissipative",
-                    "patch_param": {"name": "g_kv_cubic", "unit": "1/(J*s)", "default_value": 0.45, "min_value": 0.0},
-                    "patch_expressions": {"0": "g_kv_cubic * (V_m**2)"},
-                }
-        elif any(
-            k in q_lc
-            for k in ("thermal", "heat", "entropy", "temperature", "engine", "carnot", "battery", "runaway", "cooling")
-        ):
-            spec_dict = {
-                "name": "synthesized_generic_thermo_mechanical_system",
-                "domain": domain if domain != "multiphysics" else "thermodynamics_and_energy",
-                "time_unit": "s",
-                "energy_unit": "J",
-                "state_specs": [
-                    {"name": "q_disp", "unit": "m", "default_value": 1.8, "homeostatic_min": -10.0, "homeostatic_max": 10.0},
-                    {"name": "p_mom", "unit": "kg*m/s", "default_value": 0.0, "homeostatic_min": -15.0, "homeostatic_max": 15.0},
-                    {"name": "E_therm", "unit": "J", "default_value": 1.0, "homeostatic_min": 0.0, "homeostatic_max": 50.0, "hard_min": 0.0},
-                ],
-                "param_specs": [
-                    {"name": "k_spring", "unit": "J/m**2", "default_value": 2.0, "min_value": 0.1, "max_value": 20.0, "tunable": True},
-                    {"name": "inv_m", "unit": "1/kg", "default_value": 1.0, "min_value": 0.1, "max_value": 10.0, "tunable": False},
-                    {"name": "gamma_visc", "unit": "kg/s", "default_value": 0.6, "min_value": 0.0, "max_value": 10.0, "tunable": True},
-                ],
-                "hamiltonian_expr": "0.5 * k_spring * q_disp**2 + 0.5 * inv_m * p_mom**2",
-                "dissipation_diag_exprs": ["0.0", "gamma_visc", "0.0"],
-                "skew_routing_exprs": {"0,1": "1.0"},
-                "external_drive_exprs": ["0.0", "0.0", "0.0"],
-                "thermal_sink_state_name": "E_therm",
-                "thermal_capacity_scale": 1.0,
-                "spatial_nodes_3d": [
-                    {
-                        "node_id": "mechanical_oscillator_3d",
-                        "position_state_names": ["q_disp"],
-                        "momentum_state_names": ["p_mom"],
-                        "fixed_position_m": [1.8, 0.0, 0.0],
-                        "volume_m3": 1.0e-3,
-                        "radius_m": 0.062,
-                        "associated_state_names": ["q_disp", "p_mom"],
-                    },
-                    {
-                        "node_id": "thermal_reservoir_bath_3d",
-                        "fixed_position_m": [0.0, 0.05, 0.0],
-                        "volume_m3": 5.0e-3,
-                        "radius_m": 0.106,
-                        "associated_state_names": ["E_therm"],
-                    },
-                ],
-            }
-            target_obj = {"q_disp": 0.2}
-        elif any(
-            k in q_lc
-            for k in ("quantum", "qubit", "decoherence", "lindblad", "bloch", "rabi", "dephasing", "coherence")
-        ):
-            spec_dict = {
-                "name": "synthesized_quantum_quadrature_lindblad_system",
-                "domain": domain if domain != "multiphysics" else "quantum_open_systems",
-                "time_unit": "s",
-                "energy_unit": "J",
-                "state_specs": [
-                    {"name": "q_coh", "unit": "1", "default_value": 1.4, "homeostatic_min": -5.0, "homeostatic_max": 5.0},
-                    {"name": "p_coh", "unit": "1", "default_value": 0.6, "homeostatic_min": -5.0, "homeostatic_max": 5.0},
-                ],
-                "param_specs": [
-                    {"name": "h_omega", "unit": "J", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": True},
-                    {"name": "gamma_dephase", "unit": "1/(J*s)", "default_value": 0.5, "min_value": 0.01, "max_value": 5.0, "tunable": True},
-                    {"name": "u_rabi_drive", "unit": "1/s", "default_value": 0.8, "min_value": -5.0, "max_value": 5.0, "tunable": True},
-                ],
-                "hamiltonian_expr": "0.5 * h_omega * (q_coh**2 + p_coh**2)",
-                "dissipation_diag_exprs": ["gamma_dephase", "gamma_dephase"],
-                "skew_routing_exprs": {"0,1": "0.25 * gamma_dephase"},
-                "external_drive_exprs": ["u_rabi_drive", "0.0"],
-                "spatial_nodes_3d": [
-                    {
-                        "node_id": "bloch_cavity_mode_3d",
-                        "position_state_names": ["q_coh", "p_coh"],
-                        "fixed_position_m": [0.0, 0.0, 0.0],
-                        "volume_m3": 1.0e-9,
-                        "radius_m": 6.2e-4,
-                        "associated_state_names": ["q_coh", "p_coh"],
-                    }
-                ],
-            }
-            target_obj = {"q_coh": 0.8}
-        else:
-            # Universal 5-Compartment Causal Blast-Radius & Bystander-Shielded Port-Hamiltonian System
-            spec_dict = {
-                "name": "synthesized_universal_coupled_transport_system",
-                "domain": domain,
-                "time_unit": "s",
-                "energy_unit": "1",
-                "state_specs": [
-                    {"name": "x_primary", "unit": "1", "default_value": 2.4, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "primary_target"},
-                    {"name": "x_local_stress", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "local_stress"},
-                    {"name": "x_energy_reservoir", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "energy_reservoir"},
-                    {"name": "x_co_located_bystander", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "co_located_bystander"},
-                    {"name": "x_downstream_receiver", "unit": "1", "default_value": 1.0, "homeostatic_min": 0.05, "homeostatic_max": 8.0, "hard_min": 0.0, "causal_role": "downstream_receiver"},
-                ],
-                "param_specs": [
-                    {"name": "k_chem_1", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": True},
-                    {"name": "k_chem_2", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": True},
-                    {"name": "k_chem_3", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": False},
-                    {"name": "k_chem_4", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": False},
-                    {"name": "k_chem_5", "unit": "1", "default_value": 1.5, "min_value": 0.1, "max_value": 10.0, "tunable": False},
-                    {"name": "g_clearance_1", "unit": "1/s", "default_value": 0.8, "min_value": 0.05, "max_value": 10.0, "tunable": True},
-                    {"name": "g_clearance_2", "unit": "1/s", "default_value": 0.7, "min_value": 0.05, "max_value": 10.0, "tunable": True},
-                    {"name": "g_clearance_3", "unit": "1/s", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": False},
-                    {"name": "g_clearance_4", "unit": "1/s", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": False},
-                    {"name": "g_clearance_5", "unit": "1/s", "default_value": 0.6, "min_value": 0.05, "max_value": 10.0, "tunable": False},
-                    {"name": "g_onsager_cpl", "unit": "1/s", "default_value": 0.15, "min_value": 0.0, "max_value": 5.0, "tunable": True},
-                    {"name": "u_basal_1", "unit": "1/s", "default_value": 1.4, "min_value": 0.0, "max_value": 10.0, "tunable": True},
-                    {"name": "u_basal_2", "unit": "1/s", "default_value": 0.75, "min_value": 0.0, "max_value": 10.0, "tunable": False},
-                    {"name": "u_basal_3", "unit": "1/s", "default_value": 0.65, "min_value": 0.0, "max_value": 10.0, "tunable": False},
-                    {"name": "u_basal_4", "unit": "1/s", "default_value": 0.65, "min_value": 0.0, "max_value": 10.0, "tunable": False},
-                    {"name": "u_basal_5", "unit": "1/s", "default_value": 0.65, "min_value": 0.0, "max_value": 10.0, "tunable": False},
-                ],
-                "hamiltonian_expr": (
-                    "0.5 * k_chem_1 * x_primary**2 + 0.5 * k_chem_2 * x_local_stress**2 "
-                    "+ 0.5 * k_chem_3 * x_energy_reservoir**2 + 0.5 * k_chem_4 * x_co_located_bystander**2 "
-                    "+ 0.5 * k_chem_5 * x_downstream_receiver**2"
-                ),
-                "dissipation_diag_exprs": [
-                    "g_clearance_1 * (1.0 + 0.15 * x_local_stress**2)",
-                    "g_clearance_2",
-                    "g_clearance_3",
-                    "g_clearance_4",
-                    "g_clearance_5",
-                ],
-                "dissipation_coupling_exprs": {
-                    "0,1": "g_onsager_cpl",
-                    "0,2": "0.5 * g_onsager_cpl",
-                    "0,3": "0.35 * g_onsager_cpl",
-                    "0,4": "0.25 * g_onsager_cpl",
-                },
-                "skew_routing_exprs": {},
-                "external_drive_exprs": [
-                    "u_basal_1 * (x_energy_reservoir / (0.5 + x_energy_reservoir)) / (1.0 + 0.25 * x_local_stress**2)",
-                    "u_basal_2",
-                    "u_basal_3",
-                    "u_basal_4",
-                    "u_basal_5",
-                ],
-                "spatial_nodes_3d": [
-                    {
-                        "node_id": "primary_compartment_3d",
-                        "fixed_position_m": [0.0, 0.0, 0.0],
-                        "volume_m3": 1.0e-12,
-                        "radius_m": 6.203e-5,
-                        "associated_state_names": ["x_primary"],
-                    },
-                    {
-                        "node_id": "local_stress_compartment_3d",
-                        "fixed_position_m": [1.0e-4, 0.0, 0.0],
-                        "volume_m3": 1.0e-12,
-                        "radius_m": 6.203e-5,
-                        "associated_state_names": ["x_local_stress"],
-                    },
-                    {
-                        "node_id": "energy_reservoir_compartment_3d",
-                        "fixed_position_m": [0.0, 1.0e-4, 0.0],
-                        "volume_m3": 1.5e-12,
-                        "radius_m": 7.101e-5,
-                        "associated_state_names": ["x_energy_reservoir"],
-                    },
-                    {
-                        "node_id": "co_located_bystander_compartment_3d",
-                        "fixed_position_m": [-1.2e-4, 0.0, 0.0],
-                        "volume_m3": 1.0e-12,
-                        "radius_m": 6.203e-5,
-                        "associated_state_names": ["x_co_located_bystander"],
-                    },
-                    {
-                        "node_id": "downstream_receiver_compartment_3d",
-                        "fixed_position_m": [0.0, 0.0, 2.5e-4],
-                        "volume_m3": 2.0e-12,
-                        "radius_m": 7.816e-5,
-                        "associated_state_names": ["x_downstream_receiver"],
-                    },
-                ],
-            }
-            target_obj = {"x_primary": 1.0}
-            if is_anomaly_discovery:
-                anomaly_patch = {
-                    "thermodynamic_mode": "passive_dissipative",
-                    "patch_param": {
-                        "name": "g_nl_anom",
-                        "unit": "1/s",
-                        "default_value": 0.35,
-                        "min_value": 0.0,
-                    },
-                    "patch_expressions": {"0": "g_nl_anom * (x_primary**2)"},
-                }
-
-        result: dict[str, Any] = {
-            "candidate_spec": spec_dict,
-            "target_state_objective": target_obj,
-            "inverse_mode": inv_mode,
-            "unmodeled_anomaly_patch": anomaly_patch,
-            "synthesis_rationale": (
-                f"Synthesized dimensionally homogeneous Port-Hamiltonian world model "
-                f"'{spec_dict['name']}' (mode={inv_mode}) for open-ended hypothesis: {question[:140]}"
-            ),
-        }
-        return json.dumps(result), result
-
-    @staticmethod
-    def _handle_symbolic_repair(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        spec_dict = dict(payload.get("candidate_spec", {}))
-        error_msg = str(payload.get("diagnostic_error", ""))
-        state_specs = spec_dict.get("state_specs", [])
-        param_specs = list(spec_dict.get("param_specs", []))
-        param_by_name = {p["name"]: dict(p) for p in param_specs if isinstance(p, dict) and "name" in p}
-        time_u = parse_unit(str(spec_dict.get("time_unit", "s")))
-        energy_u = parse_unit(str(spec_dict.get("energy_unit", "J")))
-        state_unit_map = {
-            s["name"]: parse_unit(str(s.get("unit", "1")))
-            for s in state_specs
-            if isinstance(s, dict) and "name" in s
-        }
-
-        for expr_key in ("hamiltonian_expr",):
-            expr_val = str(spec_dict.get(expr_key, "0.0"))
-            open_c = expr_val.count("(")
-            close_c = expr_val.count(")")
-            if open_c > close_c:
-                spec_dict[expr_key] = expr_val + (")" * (open_c - close_c))
-            elif close_c > open_c:
-                spec_dict[expr_key] = ("(" * (close_c - open_c)) + expr_val
-
-        if "2nd Law" in error_msg or "thermodynamic" in error_msg.lower() or "dissipation" in error_msg.lower():
-            repaired_params = []
-            for p in param_specs:
-                p_copy = dict(p)
-                val = float(p_copy.get("default_value", 0.1))
-                if val < 0.0:
-                    p_copy["default_value"] = abs(val)
-                if float(p_copy.get("min_value", 0.0)) < 0.0:
-                    p_copy["min_value"] = 0.0
-                repaired_params.append(p_copy)
-                param_by_name[p_copy["name"]] = p_copy
-            spec_dict["param_specs"] = repaired_params
-            d_diag = spec_dict.get("dissipation_diag_exprs", [])
-            if isinstance(d_diag, list):
-                spec_dict["dissipation_diag_exprs"] = [
-                    re.sub(r"^\s*-\s*", "", str(expr)) for expr in d_diag
-                ]
-
-        if (
-            "DimensionError" in error_msg
-            or "DimensionalMismatchError" in error_msg
-            or "unit" in error_msg.lower()
-            or "dimension" in error_msg.lower()
-        ):
-            h_expr = str(spec_dict.get("hamiltonian_expr", "0.0"))
-            _solve_expression_dimensional_constraints(
-                h_expr,
-                target_unit=energy_u,
-                state_unit_map=state_unit_map,
-                param_by_name=param_by_name,
-            )
-
-            d_diag = list(spec_dict.get("dissipation_diag_exprs", []))
-            for idx, st in enumerate(state_specs):
-                if idx >= len(d_diag):
-                    break
-                st_u = state_unit_map[st["name"]]
-                req_r_unit = (st_u ** 2) / (energy_u * time_u)
-                _solve_expression_dimensional_constraints(
-                    str(d_diag[idx]),
-                    target_unit=req_r_unit,
-                    state_unit_map=state_unit_map,
-                    param_by_name=param_by_name,
-                )
-
-            drives = list(spec_dict.get("external_drive_exprs", []))
-            for idx, st in enumerate(state_specs):
-                if idx >= len(drives):
-                    break
-                st_u = state_unit_map[st["name"]]
-                req_flow_unit = st_u / time_u
-                _solve_expression_dimensional_constraints(
-                    str(drives[idx]),
-                    target_unit=req_flow_unit,
-                    state_unit_map=state_unit_map,
-                    param_by_name=param_by_name,
-                )
-
-            d_cpl = spec_dict.get("dissipation_coupling_exprs", {})
-            if isinstance(d_cpl, dict):
-                for pair_k, cpl_expr in d_cpl.items():
-                    if isinstance(pair_k, str) and "," in pair_k:
-                        parts = pair_k.strip("()[] ").split(",")
-                        i_idx, j_idx = int(parts[0]), int(parts[1])
-                        if 0 <= i_idx < len(state_specs) and 0 <= j_idx < len(state_specs):
-                            u_i = state_unit_map[state_specs[i_idx]["name"]]
-                            u_j = state_unit_map[state_specs[j_idx]["name"]]
-                            req_rcpl_unit = (u_i * u_j) / (energy_u * time_u)
-                            _solve_expression_dimensional_constraints(
-                                str(cpl_expr),
-                                target_unit=req_rcpl_unit,
-                                state_unit_map=state_unit_map,
-                                param_by_name=param_by_name,
-                            )
-
-            s_cpl = spec_dict.get("skew_routing_exprs") or spec_dict.get("skew_coupling_exprs") or {}
-            if isinstance(s_cpl, dict):
-                for pair_k, skew_expr in s_cpl.items():
-                    if isinstance(pair_k, str) and "," in pair_k:
-                        parts = pair_k.strip("()[] ").split(",")
-                        i_idx, j_idx = int(parts[0]), int(parts[1])
-                        if 0 <= i_idx < len(state_specs) and 0 <= j_idx < len(state_specs):
-                            u_i = state_unit_map[state_specs[i_idx]["name"]]
-                            u_j = state_unit_map[state_specs[j_idx]["name"]]
-                            req_j_unit = (u_i * u_j) / (energy_u * time_u)
-                            _solve_expression_dimensional_constraints(
-                                str(skew_expr),
-                                target_unit=req_j_unit,
-                                state_unit_map=state_unit_map,
-                                param_by_name=param_by_name,
-                            )
-
-            spec_dict["param_specs"] = list(param_by_name.values())
-
-        result = {
-            "repaired_spec": spec_dict,
-            "repair_rationale": f"Resolved compiler/shield diagnostic: {error_msg[:160]}",
-        }
-        return json.dumps(result), result
-
-    @staticmethod
-    def _handle_spark_audit(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        op_name = str(payload.get("operator_or_mode", "compiled_operator"))
-        audit_ok = bool(payload.get("thermodynamic_audit_passed", True))
-        result = {
-            "verified": audit_ok,
-            "audit_summary": (
-                f"Muse Spark verified dimensional homogeneity and thermodynamic port-Hamiltonian "
-                f"compliance for '{op_name}' (passed={audit_ok})."
-            ),
-        }
-        return json.dumps(result), result
-
-    @staticmethod
-    def _handle_red_team_review(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        passed_all = bool(payload.get("passed_all_gates", True))
-        noisy_r2 = float(payload.get("noisy_vector_field_r2", 1.0))
-        ood_v = float(payload.get("ood_viable_fraction", 1.0))
-        result = {
-            "falsification_survived": passed_all,
-            "red_team_verdict": (
-                f"Muse Spark Open adversarial stress-test verdict: survived={passed_all} "
-                f"(noisy_r2={noisy_r2:.4f}, ood_viable={ood_v:.3f})."
-            ),
-        }
-        return json.dumps(result), result
-
-    @staticmethod
-    def _handle_action_selection(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        briefing = payload.get("epistemic_briefing", {})
-        completed = set(payload.get("completed_actions", []))
-        has_data = bool(payload.get("has_observed_data", False))
-        zero_prior = bool(payload.get("zero_prior_model", False))
-        num_competing = int(payload.get("num_competing_candidates", 0))
-        inverse_mode = payload.get("requested_inverse_mode")
-        can_crystallize = bool(payload.get("has_vault", False))
-
-        # 1. If starting from raw data with zero prior model, run autonomous system discovery
-        if zero_prior and "discover_symbolic_law_or_latent_state" not in completed:
-            action = {
-                "tool_name": "discover_symbolic_law_or_latent_state",
-                "arguments": {"autonomous_from_scratch": True},
-                "epistemic_rationale": (
-                    "No prior baseline model is specified; synthesizing coupled multi-variable "
-                    "differential equations directly from observed state trajectories."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 2. Always inspect baseline forward dynamics first if no trajectory telemetry exists
-        if "simulate_and_inspect_dynamics" not in completed and not has_data:
-            action = {
-                "tool_name": "simulate_and_inspect_dynamics",
-                "arguments": {},
-                "epistemic_rationale": (
-                    "Roll out baseline trajectory to measure phase-space divergence, energy balance, "
-                    "and homeostatic safety margins."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 3. If observed trajectory data is present, calibrate parameters and audit the residual
-        if has_data and "calibrate_and_diagnose_residual" not in completed:
-            action = {
-                "tool_name": "calibrate_and_diagnose_residual",
-                "arguments": {},
-                "epistemic_rationale": (
-                    "Calibrate tunable parameters via the 4-stage elimination funnel and test "
-                    "whether the residual vector field exceeds the Layer 1 noise gate."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 4. Inspect residual telemetry to decide whether symbolic or latent discovery is required
-        res_sum = briefing.get("residual_summary")
-        if (
-            isinstance(res_sum, dict)
-            and res_sum.get("has_unmodeled_mechanism", False)
-            and "discover_symbolic_law_or_latent_state" not in completed
-        ):
-            is_nm = bool(res_sum.get("is_non_markovian_hysteresis", False))
-            t_class = str(res_sum.get("thermodynamic_class", "passive_dissipative"))
-            action = {
-                "tool_name": "discover_symbolic_law_or_latent_state",
-                "arguments": {
-                    "prefer_latent": is_nm,
-                    "thermodynamic_slot": t_class,
-                },
-                "epistemic_rationale": (
-                    f"Residual SNR={res_sum.get('max_snr')} exceeds noise floor "
-                    f"(non_markovian_hysteresis={is_nm}, thermodynamic_class={t_class}); "
-                    f"invoking Layer 5 discovery."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 5. If multiple competing hypotheses exist, design an active disambiguating experiment
-        if num_competing >= 2 and "design_disambiguating_experiment" not in completed:
-            action = {
-                "tool_name": "design_disambiguating_experiment",
-                "arguments": {},
-                "epistemic_rationale": (
-                    f"Detected {num_competing} competing hypotheses; optimizing an experimental initial "
-                    f"state x0* and stimulus waveform u*(t) to maximize prediction divergence."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 6. Map equilibria & bifurcations if requested or before solving an inverse problem
-        target_obj = briefing.get("target_state_objective")
-        question_lc = str(payload.get("question", "")).lower()
-        wants_equilibria = any(
-            kw in question_lc for kw in ("equilibri", "bifurcat", "tipping", "bistab", "steady", "attractor")
-        )
-        if (
-            (wants_equilibria or target_obj is not None or inverse_mode is not None)
-            and briefing.get("equilibrium_summary") is None
-            and "map_equilibria_and_bifurcations" not in completed
-        ):
-            action = {
-                "tool_name": "map_equilibria_and_bifurcations",
-                "arguments": {},
-                "epistemic_rationale": (
-                    "Map steady-state attractors, saddle points, and local Jacobian eigenvalues across "
-                    "the phase-space landscape."
-                ),
-            }
-            return json.dumps(action), action
-
-        if (target_obj is not None or inverse_mode is not None) and "solve_inverse_problem" not in completed:
-
-            if (
-                briefing.get("sensitivity_summary") is None
-                and int(briefing.get("param_dim", 0)) > 0
-                and "analyze_fisher_sensitivity_and_leverage" not in completed
-            ):
-                action = {
-                    "tool_name": "analyze_fisher_sensitivity_and_leverage",
-                    "arguments": {},
-                    "epistemic_rationale": (
-                        "Compute the Fisher Information Matrix to identify high-leverage parameters "
-                        "and filter out structurally sloppy / feedback-compensated parameters."
-                    ),
-                }
-                return json.dumps(action), action
-
-            sens = briefing.get("sensitivity_summary") or {}
-            high_lev_names = list(sens.get("top_leverage_parameters", []))
-            mode_to_run = inverse_mode or "counterfactual_intervention"
-            action = {
-                "tool_name": "solve_inverse_problem",
-                "arguments": {
-                    "mode": mode_to_run,
-                    "selected_parameter_names": high_lev_names,
-                },
-                "epistemic_rationale": (
-                    f"Execute inverse solver (mode='{mode_to_run}') targeting high-leverage "
-                    f"parameters {high_lev_names} while enforcing homeostatic viability bounds."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 7. Extract conservation invariants and cross-domain LawVault isomorphisms
-        if "extract_conservation_invariants_and_archetype" not in completed:
-            action = {
-                "tool_name": "extract_conservation_invariants_and_archetype",
-                "arguments": {},
-                "epistemic_rationale": (
-                    "Extract Lie-derivative conservation invariants and query the LawVault for "
-                    "cross-domain mathematical operator isomorphisms."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 8. Run 4-gate adversarial falsification stress test (and crystallize if LawVault is attached)
-        if "adversarial_falsify_and_crystallize" not in completed:
-            action = {
-                "tool_name": "adversarial_falsify_and_crystallize",
-                "arguments": {"crystallize": can_crystallize},
-                "epistemic_rationale": (
-                    "Subject the active model to the 4-gate adversarial falsification suite "
-                    "(thermodynamic shield audit, thermal noise shake, OOD extrapolation, and "
-                    "time-reversal/invariant stability)."
-                ),
-            }
-            return json.dumps(action), action
-
-        # 9. Conclude investigation once all mathematical objectives and stress tests are complete
-        action = {
-            "tool_name": "conclude_investigation",
-            "arguments": {},
-            "epistemic_rationale": "All epistemic, inverse, and falsification gates are satisfied.",
-        }
-        return json.dumps(action), action
-
-    @staticmethod
-    def _handle_dossier_narrative(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        sys_name = str(payload.get("system_name", "unknown_system"))
-        steps = list(payload.get("executed_tools", []))
-        invariants = list(payload.get("conserved_invariants", []))
-        analogues = list(payload.get("vault_analogues", []))
-        pf = payload.get("primary_finding") or {}
-
-        sentences: list[str] = [
-            f"Completed closed-loop mathematical investigation of '{sys_name}' across "
-            f"{len(steps)} operator steps ({', '.join(steps)})."
-        ]
-
-        disc_eqs = pf.get("discovered_equations") or {}
-        if disc_eqs:
-            eq_str = "; ".join(f"{k}: {v}" for k, v in disc_eqs.items())
-            r2_val = pf.get("discovery_r2")
-            r2_txt = f" (R^2={float(r2_val):.5f})" if r2_val is not None else ""
-            sentences.append(f"Discovered governing symbolic operator(s){r2_txt}: {eq_str}.")
-
-        interv = pf.get("prescribed_intervention")
-        if isinstance(interv, dict):
-            shifts = interv.get("param_shifts", {})
-            shift_parts = [
-                f"{p_k}: {v['baseline']:.4g} -> {v['intervened']:.4g} {v['unit']} ({v['percent_change']:+.1f}%)"
-                for p_k, v in shifts.items()
-                if abs(float(v.get("delta", 0.0))) > 1e-6
-            ]
-            sloppy_excl = interv.get("excluded_sloppy_parameters", [])
-            trans = interv.get("state_transitions", {})
-            trans_parts = [
-                f"{s_k}: {sv['initial']:.4g} -> {sv['final_restored']:.4g} {sv['unit']}"
-                + (f" (target={sv['target']:.4g})" if sv.get("target") is not None else "")
-                for s_k, sv in trans.items()
-            ]
-            sentences.append(
-                f"Prescribed multi-parameter intervention [{', '.join(shift_parts)}] "
-                f"(excluding sloppy parameters {sloppy_excl}), driving state transition "
-                f"[{', '.join(trans_parts)}] and reducing objective loss from "
-                f"{float(interv.get('baseline_loss', 0.0)):.4g} to {float(interv.get('intervened_loss', 0.0)):.4g}."
-            )
-
-        ctrl = pf.get("optimal_control_summary")
-        if isinstance(ctrl, dict):
-            sentences.append(
-                f"Synthesized optimal control waveform u*(t) reducing target loss from "
-                f"{float(ctrl.get('baseline_loss', 0.0)):.4g} to {float(ctrl.get('controlled_loss', 0.0)):.4g} "
-                f"(control_energy={float(ctrl.get('control_energy', 0.0)):.4g}, "
-                f"all_time_viable={bool(ctrl.get('all_time_viable', True))})."
-            )
-
-        ret_bvp = pf.get("retrodiction_or_bvp_summary")
-        if isinstance(ret_bvp, dict):
-            sentences.append(
-                f"Solved {ret_bvp.get('mode')} initial state x(0)={ret_bvp.get('reconstructed_or_solved_initial_state')}."
-            )
-
-        disambig = pf.get("disambiguation_summary")
-        if isinstance(disambig, dict):
-            sentences.append(
-                f"Active experimental design amplified hypothesis divergence by "
-                f"{float(disambig.get('divergence_amplification_ratio', 1.0)):.2f}x and isolated "
-                f"'{disambig.get('selected_model')}' ({disambig.get('winning_hypothesis')})."
-            )
-
-        f_cert = pf.get("falsification_certificate")
-        if isinstance(f_cert, dict):
-            c_id = f_cert.get("crystallized_law_id")
-            c_txt = f", crystallized as '{c_id}' (SHA-256={str(f_cert.get('sha256_hash', ''))[:12]}...)" if c_id else ""
-            sentences.append(
-                f"Falsification stress-test: passed_all={bool(f_cert.get('passed_all_gates'))} "
-                f"(noisy_r2={float(f_cert.get('noisy_vector_field_r2', 0.0)):.4f}, "
-                f"ood_viable={float(f_cert.get('ood_viable_fraction', 0.0)):.3f}, "
-                f"horizon_4x_viable={float(f_cert.get('horizon_4x_viable_fraction', 0.0)):.3f}){c_txt}."
-            )
-
-        summary_obj = {
-            "executive_summary": " ".join(sentences),
-            "conserved_quantities": invariants,
-            "cross_domain_isomorphisms": analogues,
-        }
-        return json.dumps(summary_obj), summary_obj
-
-
 class MultiProviderMetaClient:
     """
     Unified AI inference client supporting Fireworks AI, Baseten, Meta Model API,
@@ -1266,20 +334,22 @@ class MultiProviderMetaClient:
     ) -> None:
         load_dotenv()
         env = dict(os.environ)
-        if (
-            env_overrides is None
-            and http_transport is None
-            and "PYTEST_CURRENT_TEST" in os.environ
-            and os.environ.get("CORTIVRA_LIVE_PYTEST") != "1"
-        ):
-            for k in ("FIREWORKS_API_KEY", "BASETEN_API_KEY", "META_API_KEY", "LOCAL_LLM_BASE_URL"):
-                env[k] = ""
         if env_overrides:
             env.update(env_overrides)
 
         self._http_transport = http_transport
         self._timeout = timeout_seconds
         self.telemetry_log: list[LLMInferenceResponse] = []
+        self._telemetry_lock = threading.Lock()
+        self._bg_pool: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=10) if self._http_transport is None else None
+        )
+        self._pending_futures: list[Future[LLMInferenceResponse]] = []
+        self._shared_http_client = httpx.Client(
+            transport=self._http_transport,
+            timeout=self._timeout,
+            limits=httpx.Limits(max_keepalive_connections=16, max_connections=32),
+        )
 
         baseten_default_model = env.get(
             "BASETEN_MODEL",
@@ -1348,7 +418,7 @@ class MultiProviderMetaClient:
         """
         Return the ordered list of live inference providers that currently have active credentials.
         """
-        order: list[ProviderName] = ["fireworks", "baseten", "meta", "local"]
+        order: list[ProviderName] = ["baseten", "fireworks", "meta", "local"]
         return [p for p in order if self.providers[p].is_configured]
 
     def _provider_priority_for_request(self, request: LLMInferenceRequest) -> list[ProviderName]:
@@ -1360,25 +430,65 @@ class MultiProviderMetaClient:
             ordered = [request.preferred_provider] + [p for p in active if p != request.preferred_provider]
             return ordered
 
-        if request.role == "muse_spark_open":
-            pref = ["fireworks", "baseten", "meta", "local"]
-        else:
-            pref = ["meta", "fireworks", "baseten", "local"]
+        pref: list[ProviderName] = ["baseten", "fireworks", "meta", "local"]
         return [p for p in pref if p in active]
+
+    def has_cached_response(self, request: LLMInferenceRequest) -> bool:
+        """Always returns False (100% live AI inference, zero warm/disk caching)."""
+        return False
+
+    def invoke_background(self, request: LLMInferenceRequest) -> Future[LLMInferenceResponse]:
+        """
+        Dispatch a live AI inference request asynchronously on `_bg_pool` when in live
+        network mode (`_http_transport is None`) so CPU math and HTTP inference overlap,
+        or synchronously when `_http_transport is not None` (unit-test transport mode).
+        """
+        if self._bg_pool is None:
+            fut: Future[LLMInferenceResponse] = Future()
+            try:
+                fut.set_result(self.invoke(request))
+            except Exception as exc:
+                fut.set_exception(exc)
+            return fut
+
+        from cortivra.observability.flight_recorder import submit_with_recorder
+
+        fut = submit_with_recorder(self._bg_pool, self.invoke, request)
+        with self._telemetry_lock:
+            self._pending_futures.append(fut)
+        return fut
+
+    def flush_background_invocations(self) -> None:
+        """Wait for all in-flight background live AI requests to complete."""
+        with self._telemetry_lock:
+            futs = list(self._pending_futures)
+            self._pending_futures.clear()
+        for f in futs:
+            try:
+                f.result(timeout=self._timeout)
+            except Exception:
+                pass
 
     def invoke(self, request: LLMInferenceRequest) -> LLMInferenceResponse:
         """
-        Execute an AI inference request across the prioritized live providers (Fireworks AI,
-        Baseten, Meta Model API, Local), automatically failing over on transient network/5xx
-        errors. If no external API credentials are set in the environment yet, executes the
-        `MathematicalEpistemicPolicy` over the prompt telemetry.
+        Execute a live AI inference request across the prioritized live providers (Baseten,
+        Fireworks AI, Meta Model API, Local), automatically failing over on transient network/5xx
+        errors. Raises a RuntimeError if no live AI provider is configured or if all live
+        providers fail (zero offline LLM fallback, zero warm caching).
         """
         candidates = self._provider_priority_for_request(request)
+        if not candidates:
+            raise RuntimeError(
+                "No live AI provider is configured in the environment (.env). "
+                "Please set BASETEN_API_KEY, FIREWORKS_API_KEY, META_API_KEY, or LOCAL_LLM_BASE_URL."
+            )
         failover_count = 0
+        last_error: Exception | None = None
 
         for prov_name in candidates:
             cfg = self.providers[prov_name]
             model_name = cfg.model_for_role(request.role)
+
             url = f"{cfg.base_url}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {cfg.api_key}",
@@ -1393,57 +503,52 @@ class MultiProviderMetaClient:
                 "temperature": request.temperature,
                 "max_tokens": request.max_tokens,
             }
+            if prov_name == "baseten" and self._http_transport is None:
+                body["reasoning_effort"] = "low"
             if request.require_json:
                 body["response_format"] = {"type": "json_object"}
 
-            t0 = time.perf_counter()
-            try:
-                with httpx.Client(transport=self._http_transport, timeout=self._timeout) as client:
-                    resp = client.post(url, headers=headers, json=body)
+            max_attempts = 2 if self._http_transport is None else 1
+            for attempt_idx in range(max_attempts):
+                t0 = time.perf_counter()
+                try:
+                    resp = self._shared_http_client.post(url, headers=headers, json=body)
                     resp.raise_for_status()
                     data = resp.json()
 
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                msg_obj = data["choices"][0]["message"]
-                raw_c = msg_obj.get("content")
-                if not raw_c:
-                    raw_c = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or ""
-                content = str(raw_c)
-                usage = data.get("usage", {})
-                p_tok = int(usage.get("prompt_tokens", 0))
-                c_tok = int(usage.get("completion_tokens", 0))
-                parsed = _extract_json_object(content) if request.require_json else None
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    msg_obj = data["choices"][0]["message"]
+                    raw_c = msg_obj.get("content")
+                    if not raw_c:
+                        raw_c = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or ""
+                    content = str(raw_c)
+                    usage = data.get("usage", {})
+                    p_tok = int(usage.get("prompt_tokens", 0))
+                    c_tok = int(usage.get("completion_tokens", 0))
+                    parsed = _extract_json_object(content) if request.require_json else None
 
-                record = LLMInferenceResponse(
-                    role=request.role,
-                    provider_used=prov_name,
-                    model_used=model_name,
-                    raw_content=content,
-                    parsed_json=parsed,
-                    latency_ms=round(elapsed_ms, 3),
-                    prompt_tokens=p_tok,
-                    completion_tokens=c_tok,
-                    failover_attempts=failover_count,
-                )
-                self.telemetry_log.append(record)
-                return record
-            except Exception:
-                failover_count += 1
-                continue
+                    record = LLMInferenceResponse(
+                        role=request.role,
+                        provider_used=prov_name,
+                        model_used=model_name,
+                        raw_content=content,
+                        parsed_json=parsed,
+                        latency_ms=round(elapsed_ms, 3),
+                        prompt_tokens=p_tok,
+                        completion_tokens=c_tok,
+                        failover_attempts=failover_count,
+                    )
+                    with self._telemetry_lock:
+                        self.telemetry_log.append(record)
+                    return record
+                except Exception as exc:
+                    last_error = exc
+                    if attempt_idx + 1 < max_attempts:
+                        body.pop("reasoning_effort", None)
+                        continue
+            failover_count += 1
 
-        t0 = time.perf_counter()
-        raw_text, parsed_dict = MathematicalEpistemicPolicy.infer_response(request)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        record = LLMInferenceResponse(
-            role=request.role,
-            provider_used="epistemic_policy",
-            model_used=f"{request.role}_mathematical_epistemic_policy",
-            raw_content=raw_text,
-            parsed_json=parsed_dict,
-            latency_ms=round(elapsed_ms, 3),
-            prompt_tokens=len(request.system_prompt) // 4 + len(request.user_prompt) // 4,
-            completion_tokens=len(raw_text) // 4,
-            failover_attempts=failover_count,
+        raise RuntimeError(
+            f"All configured live AI providers ({candidates}) failed after {failover_count} failover(s). "
+            f"Last error: {last_error}"
         )
-        self.telemetry_log.append(record)
-        return record

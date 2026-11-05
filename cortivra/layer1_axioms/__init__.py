@@ -15,6 +15,7 @@ from cortivra.layer1_axioms.hamiltonian import (
 from cortivra.layer1_axioms.shields import (
     AuditCertificate,
     ConservationViolationError,
+    GKSLQuantumCoherenceReport,
     LatentResidualAnalysis,
     ShieldResult,
     analyze_unexplained_residual,
@@ -24,6 +25,7 @@ from cortivra.layer1_axioms.shields import (
     verify_detailed_balance_cycle,
     verify_dimensional_consistency,
     verify_equation_dimensions,
+    verify_gksl_quantum_coherence_positivity,
     verify_homeostatic_viability,
     verify_mass_conservation,
     verify_quantum_unitary_norm_conservation,
@@ -175,6 +177,37 @@ from cortivra.layer1_axioms.units import (
     uV,
     uW,
 )
+from cortivra.layer1_axioms.complex_analytic_prover import (
+    ComplexAnalyticContourCertificate,
+    ComplexInterval,
+    prove_cauchy_argument_winding_and_critical_strip,
+)
+from cortivra.layer1_axioms.deductive_theorem_prover import (
+    AsymptoticInfiniteTailAndSpectralCertificate,
+    DeductiveLemma,
+    FormalDeductiveTheoremProof,
+    SymbolicMonomialIdentityCertificate,
+    construct_formal_deductive_theorem_proof,
+    prove_asymptotic_infinite_tail_and_spectral_gap,
+    prove_exact_symbolic_operator_identities,
+)
+from cortivra.layer1_axioms.lean4_smt_compiler import (
+    FormalLean4AndSMTCertificate,
+    compile_formal_lean4_and_smt2_certificates,
+)
+from cortivra.layer1_axioms.rigorous_proofs import (
+    AdversarialCounterexampleReport,
+    IntervalEnclosureProof,
+    RigorousMathematicalProofBundle,
+    ScalarInterval,
+    SingularityAndTransformReport,
+    SymbolicSOSCertificate,
+    analyze_self_similar_blowup_and_transforms,
+    hunt_adversarial_counterexamples,
+    prove_symbolic_sos_lyapunov_and_passivity,
+    verify_interval_arithmetic_enclosure,
+    verify_rigorous_mathematical_proof_bundle,
+)
 from cortivra.layer1_axioms.vault import CrystallizedLawRecord, LawVault
 
 __all__ = [
@@ -205,6 +238,8 @@ __all__ = [
     "verify_thermodynamic_laws",
     "verify_detailed_balance_cycle",
     "verify_quantum_unitary_norm_conservation",
+    "GKSLQuantumCoherenceReport",
+    "verify_gksl_quantum_coherence_positivity",
     "compute_viable_universe_mask",
     "verify_homeostatic_viability",
     "analyze_unexplained_residual",

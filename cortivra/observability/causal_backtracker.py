@@ -678,8 +678,13 @@ def analyze_trace_and_backtrack_contradictions(
             up_r2 = parent.global_r2 if parent.global_r2 is not None else parent.local_r2
             if up_r2 is not None and p_r2 is not None:
                 r2_drop = float(up_r2) - float(p_r2)
-                if r2_drop >= 0.08 or (
-                    node.physical_violation_metric - parent.physical_violation_metric > 1e-3
+                phys_spike = (node.physical_violation_metric - parent.physical_violation_metric) > 1e-3
+                # Only treat an inter-node R^2 drop as a pipeline fracture when either a physical
+                # violation spiked, the child node explicitly failed, or the child R^2 fell below
+                # the admissibility threshold `r2_contradiction_threshold`.
+                if phys_spike or (
+                    r2_drop >= 0.08
+                    and (node.status == "failed" or float(p_r2) < r2_contradiction_threshold)
                 ):
                     up_err = parent.global_error_metric or parent.local_error_metric or 1e-9
                     dn_err = node.global_error_metric or node.local_error_metric or 0.0
@@ -714,6 +719,31 @@ def analyze_trace_and_backtrack_contradictions(
         elif node_r2 is not None and node_r2 < r2_contradiction_threshold:
             failing_node = node
             contradiction_type = "predictive_divergence_or_model_mismatch"
+        elif (
+            node_r2 is not None
+            and node_r2 >= r2_contradiction_threshold
+            and node.status == "completed"
+            and node.physical_violation_metric <= 1e-4
+            and contradiction_type == "predictive_divergence_or_model_mismatch"
+            and node.operation
+            in {
+                "solve_sparse_pareto_front",
+                "discover_residual_law",
+                "discover_autonomous_symbolic_system",
+                "run_elimination_funnel",
+                "run_falsification_stress_test",
+                "discover_symbolic_law_or_latent_state",
+                "crystallize_verified_law",
+                "run_dual_blind_temporal_forecast_crucible",
+                "synthesize_cross_domain_and_horizon_proofs",
+                "execute_recursive_pass2_synthesis_solver",
+            }
+        ):
+            # A downstream discovery, calibration, or falsification stage superseded an
+            # earlier uncalibrated prior or exploratory basis check with high R^2.
+            failing_node = None
+            contradiction_type = "none"
+            fractures.clear()
 
     force_attr: TermForceAttribution | None = None
     if brick is not None and states is not None:

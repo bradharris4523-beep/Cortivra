@@ -297,11 +297,15 @@ def _levenberg_marquardt_vector_field_polish(
                 allow_unused=True,
             )[0]
             jac_rows.append(g_r.squeeze(0) if g_r is not None else torch.zeros((p_dim,), dtype=torch.float64, device=flat_x.device))
-        j_mat = torch.stack(jac_rows, dim=0)  # [n_res, p_dim]
+        j_mat = torch.nan_to_num(torch.stack(jac_rows, dim=0), nan=0.0, posinf=1e6, neginf=-1e6)  # [n_res, p_dim]
+        res_clean = torch.nan_to_num(res_vec.detach(), nan=0.0, posinf=1e6, neginf=-1e6)
 
-        lhs = (j_mat.T @ j_mat) + lm_lam * eye_p
-        rhs = -(j_mat.T @ res_vec.detach().unsqueeze(-1))
-        delta_p = torch.linalg.lstsq(lhs, rhs, driver="gelsd").solution.squeeze(-1).unsqueeze(0)
+        lhs = torch.nan_to_num((j_mat.T @ j_mat) + lm_lam * eye_p, nan=0.0, posinf=1e6, neginf=-1e6)
+        rhs = torch.nan_to_num(-(j_mat.T @ res_clean.unsqueeze(-1)), nan=0.0, posinf=1e6, neginf=-1e6)
+        try:
+            delta_p = torch.linalg.lstsq(lhs, rhs, driver="gelsd").solution.squeeze(-1).unsqueeze(0)
+        except RuntimeError:
+            break
 
         accepted = False
         for alpha in (1.0, 0.5, 0.2, 0.05):
@@ -370,6 +374,13 @@ def run_elimination_funnel(
         else tuple(range(brick.state_dim))
     )
     full_state_observed = len(obs_idx) == brick.state_dim and obs_idx == tuple(range(brick.state_dim))
+    obs_is_homeostatic = True
+    for col_i, s_idx in enumerate(obs_idx):
+        sp = brick.state_specs[s_idx]
+        col_vals = obs_traj[:, :, col_i]
+        if bool(((col_vals < sp.homeostatic_min) | (col_vals > sp.homeostatic_max)).any().item()):
+            obs_is_homeostatic = False
+            break
 
     if initial_full_state is not None:
         if initial_full_state.ndim == 1:
@@ -487,7 +498,7 @@ def run_elimination_funnel(
         pred_sub = short_roll.states[:, :, obs_idx]
         target_sub = obs_traj[:1, : short_steps + 1, :].expand(n_stage1, -1, -1)
         short_mse = torch.mean((pred_sub - target_sub) ** 2, dim=(1, 2))
-        viable_pen = torch.where(short_roll.all_time_viable_mask, 0.0, 1e12)
+        viable_pen = torch.where(short_roll.all_time_viable_mask, 0.0, 1e12 if obs_is_homeostatic else 0.0)
         scores = torch.where(torch.isfinite(short_mse), short_mse + viable_pen, torch.full_like(short_mse, 1e18))
 
         zoom_cands = (
@@ -512,7 +523,7 @@ def run_elimination_funnel(
             pred_sub_z = zoom_roll.states[:, :, obs_idx]
             target_sub_z = obs_traj[:1, : short_steps + 1, :].expand(n_zoom, -1, -1)
             short_mse_z = torch.mean((pred_sub_z - target_sub_z) ** 2, dim=(1, 2))
-            viable_pen_z = torch.where(zoom_roll.all_time_viable_mask, 0.0, 1e12)
+            viable_pen_z = torch.where(zoom_roll.all_time_viable_mask, 0.0, 1e12 if obs_is_homeostatic else 0.0)
             scores_z = torch.where(torch.isfinite(short_mse_z), short_mse_z + viable_pen_z, torch.full_like(short_mse_z, 1e18))
             all_cands_s1 = torch.cat([candidates_s1, zoom_cands], dim=0)
             all_x0_s1 = torch.cat([x0_s1, x0_zoom], dim=0)
@@ -536,7 +547,7 @@ def run_elimination_funnel(
     pred_mid = mid_roll.states[:, :, obs_idx]
     target_mid = obs_traj[:1, : mid_steps + 1, :].expand(n_stage2, -1, -1)
     mid_mse = torch.mean((pred_mid - target_mid) ** 2, dim=(1, 2))
-    viable_pen_s2 = torch.where(mid_roll.all_time_viable_mask, 0.0, 1e12)
+    viable_pen_s2 = torch.where(mid_roll.all_time_viable_mask, 0.0, 1e12 if obs_is_homeostatic else 0.0)
     mid_scores = torch.where(torch.isfinite(mid_mse), mid_mse + viable_pen_s2, torch.full_like(mid_mse, 1e18))
     top_s3_idx = torch.argsort(mid_scores)[:n_stage3]
     candidates_s3 = candidates_s2[top_s3_idx].clone()
@@ -721,7 +732,7 @@ def run_elimination_funnel(
     pred_full_obs = full_rollouts.states[:, :, obs_idx]
     target_full_obs = obs_traj[:1].expand(n_stage3, -1, -1)
     traj_mses = torch.mean((pred_full_obs - target_full_obs) ** 2, dim=(1, 2))
-    viable_pen_final = torch.where(full_rollouts.all_time_viable_mask, 0.0, 1e12)
+    viable_pen_final = torch.where(full_rollouts.all_time_viable_mask, 0.0, 1e12 if obs_is_homeostatic else 0.0)
 
     if full_state_observed and dx_dt_obs is not None:
         flat_x_all = obs_traj.reshape(n_exp * t_steps, brick.state_dim)

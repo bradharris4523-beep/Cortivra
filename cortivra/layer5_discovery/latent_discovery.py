@@ -60,11 +60,22 @@ from cortivra.layer4_engine.rollout_arena import (
     savitzky_golay_denoise_and_differentiate,
 )
 from cortivra.layer5_discovery.basis_library import generate_symbolic_basis_library
+from cortivra.layer5_discovery.helmholtz_and_perturber import (
+    DifferentialResidualInversionReport,
+    LatentAugmentationResult,
+    LatentAugmentedLawBrick,
+    LatentOscillatorAugmentedLawBrick,
+    NonMarkovianMemoryReport,
+    detect_non_markovian_memory,
+    discover_latent_state_augmentation,
+    invert_residual_for_unseen_perturber,
+)
 from cortivra.layer5_discovery.sparse_regression import (
     InvariantDiscoveryReport,
     ParetoDiscoveryReport,
     SymbolicCandidate,
     discover_conservation_invariants,
+    discover_fractional_power_and_log_candidates,
     discover_rational_pade_candidates,
     solve_sparse_pareto_front,
 )
@@ -185,336 +196,11 @@ class HamiltonianPatchedLawBrick(LawBrick):
         return self.delta_hamiltonian_ast.tree_complexity()
 
 
-class LatentAugmentedLawBrick(LawBrick):
-    """
-    Composite `(D + 1)`-state `LawBrick` formed by augmenting `base_brick` with an unobserved
-    internal state variable `z(t)` that couples to `target_state_index` and evolves according
-    to a relaxation / adaptation ODE:
-        `dx_{target}/dt = dx_{target, base}/dt + k_couple * z`
-        `dz/dt = -k_decay * z + drive_expr(x, params)`
-    """
-
-    def __init__(
-        self,
-        name: str,
-        base_brick: LawBrick,
-        target_state_index: int,
-        latent_state_spec: StateVarSpec,
-        latent_param_specs: Sequence[ParamSpec],
-        coupling_expr: str | ExprNode,
-        latent_drive_expr: str | ExprNode,
-        decay_param_name: str,
-    ) -> None:
-        if not (0 <= target_state_index < base_brick.state_dim):
-            raise ValueError(f"Invalid target_state_index {target_state_index}.")
-
-        self.base_brick = base_brick
-        self.base_state_dim = base_brick.state_dim
-        self.base_param_dim = base_brick.param_dim
-        self.target_state_index = target_state_index
-        self.latent_state_spec = latent_state_spec
-        self.latent_param_specs = tuple(latent_param_specs)
-        self.decay_param_name = decay_param_name
-
-        aug_states = list(base_brick.state_specs) + [latent_state_spec]
-        aug_params = list(base_brick.param_specs) + list(self.latent_param_specs)
-
-        super().__init__(
-            name=name,
-            domain=base_brick.domain,
-            state_specs=aug_states,
-            param_specs=aug_params,
-            port_specs=base_brick.port_specs,
-            time_unit=base_brick.time_unit,
-            energy_unit=base_brick.energy_unit,
-            matrix_free=base_brick.is_matrix_free,
-        )
-
-        self.symbol_table = build_symbol_table(self.state_specs, self.param_specs)
-        self.coupling_ast = (
-            coupling_expr.simplify()
-            if isinstance(coupling_expr, ExprNode)
-            else parse_symbolic_expr(coupling_expr, symbol_table=self.symbol_table).simplify()
-        )
-        self.latent_drive_ast = (
-            latent_drive_expr.simplify()
-            if isinstance(latent_drive_expr, ExprNode)
-            else parse_symbolic_expr(latent_drive_expr, symbol_table=self.symbol_table).simplify()
-        )
-        self.decay_param_index = next(
-            idx for idx, p in enumerate(self.param_specs) if p.name == decay_param_name
-        )
-
-    def _build_env(self, state: torch.Tensor, params: torch.Tensor) -> dict[str, torch.Tensor]:
-        env: dict[str, torch.Tensor] = {}
-        for idx, sp in enumerate(self.state_specs):
-            env[sp.name] = state[:, idx]
-        for idx, pp in enumerate(self.param_specs):
-            env[pp.name] = params[:, idx]
-        return env
-
-    def hamiltonian_energy(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        x_base = state[:, : self.base_state_dim]
-        p_base = params[:, : self.base_param_dim]
-        z = state[:, self.base_state_dim]
-        return self.base_brick.hamiltonian_energy(x_base, p_base) + 0.5 * (z * z)
-
-    def effort(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        x_base = state[:, : self.base_state_dim]
-        p_base = params[:, : self.base_param_dim]
-        z = state[:, self.base_state_dim : self.base_state_dim + 1]
-        e_base = self.base_brick.effort(x_base, p_base)
-        return torch.cat([e_base, z], dim=-1)
-
-    def structure_matrix(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        batch = state.shape[0]
-        n = self.state_dim
-        j_full = torch.zeros((batch, n, n), dtype=state.dtype, device=state.device)
-        if not self.base_brick.is_matrix_free:
-            j_base = self.base_brick.structure_matrix(
-                state[:, : self.base_state_dim], params[:, : self.base_param_dim]
-            )
-            j_full[:, : self.base_state_dim, : self.base_state_dim] = j_base
-        return j_full
-
-    def dissipation_matrix(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        batch = state.shape[0]
-        n = self.state_dim
-        r_full = torch.zeros((batch, n, n), dtype=state.dtype, device=state.device)
-        if not self.base_brick.is_matrix_free:
-            r_base = self.base_brick.dissipation_matrix(
-                state[:, : self.base_state_dim], params[:, : self.base_param_dim]
-            )
-            r_full[:, : self.base_state_dim, : self.base_state_dim] = r_base
-        k_dec = torch.clamp(params[:, self.decay_param_index], min=0.0)
-        r_full[:, self.base_state_dim, self.base_state_dim] = k_dec
-        return r_full
-
-    def compute_active_patch_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        env = self._build_env(state, params)
-        u = torch.zeros_like(state)
-        u[:, self.target_state_index] = self.coupling_ast.eval_tensor(env)
-        u[:, self.base_state_dim] = self.latent_drive_ast.eval_tensor(env)
-        return u
-
-    def external_patch_power(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        e = self.effort(state, params)
-        u = self.compute_active_patch_flow(state, params)
-        return (e * u).sum(dim=-1)
-
-    def flow(
-        self,
-        state: torch.Tensor,
-        params: torch.Tensor,
-        port_inputs: dict[str, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        dx_dt = super().flow(state, params, port_inputs=port_inputs)
-        return dx_dt + self.compute_active_patch_flow(state, params)
-
-
-class LatentOscillatorAugmentedLawBrick(LawBrick):
-    """
-    Composite `(D + 2)`-state `LawBrick` formed by augmenting `base_brick` with an unobserved
-    conjugate harmonic oscillator mode `(z_q(t), z_p(t))` (e.g., an unseen orbital perturber,
-    hidden electromagnetic resonator, or intracellular clock) coupled to `target_state_index`:
-        `dx_{target}/dt = dx_{target, base}/dt + k_latent_couple * z_q`
-        `dz_q/dt = omega_latent * z_p`
-        `dz_p/dt = -omega_latent * z_q - k_latent_damp * z_p`
-    """
-
-    def __init__(
-        self,
-        name: str,
-        base_brick: LawBrick,
-        target_state_index: int,
-        zq_spec: StateVarSpec,
-        zp_spec: StateVarSpec,
-        latent_param_specs: Sequence[ParamSpec],
-    ) -> None:
-        if not (0 <= target_state_index < base_brick.state_dim):
-            raise ValueError(f"Invalid target_state_index {target_state_index}.")
-
-        self.base_brick = base_brick
-        self.base_state_dim = base_brick.state_dim
-        self.base_param_dim = base_brick.param_dim
-        self.target_state_index = target_state_index
-        self.latent_param_specs = tuple(latent_param_specs)
-
-        aug_states = list(base_brick.state_specs) + [zq_spec, zp_spec]
-        aug_params = list(base_brick.param_specs) + list(self.latent_param_specs)
-
-        super().__init__(
-            name=name,
-            domain=base_brick.domain,
-            state_specs=aug_states,
-            param_specs=aug_params,
-            port_specs=base_brick.port_specs,
-            time_unit=base_brick.time_unit,
-            energy_unit=base_brick.energy_unit,
-            matrix_free=base_brick.is_matrix_free,
-        )
-
-    def hamiltonian_energy(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        x_base = state[:, : self.base_state_dim]
-        p_base = params[:, : self.base_param_dim]
-        zq = state[:, self.base_state_dim]
-        zp = state[:, self.base_state_dim + 1]
-        return self.base_brick.hamiltonian_energy(x_base, p_base) + 0.5 * (zq * zq + zp * zp)
-
-    def effort(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        x_base = state[:, : self.base_state_dim]
-        p_base = params[:, : self.base_param_dim]
-        z_pair = state[:, self.base_state_dim : self.base_state_dim + 2]
-        e_base = self.base_brick.effort(x_base, p_base)
-        return torch.cat([e_base, z_pair], dim=-1)
-
-    def structure_matrix(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        batch = state.shape[0]
-        n = self.state_dim
-        j_full = torch.zeros((batch, n, n), dtype=state.dtype, device=state.device)
-        if not self.base_brick.is_matrix_free:
-            j_base = self.base_brick.structure_matrix(
-                state[:, : self.base_state_dim], params[:, : self.base_param_dim]
-            )
-            j_full[:, : self.base_state_dim, : self.base_state_dim] = j_base
-        omega = params[:, self.base_param_dim + 1]
-        idx_q = self.base_state_dim
-        idx_p = self.base_state_dim + 1
-        j_full[:, idx_q, idx_p] = omega
-        j_full[:, idx_p, idx_q] = -omega
-        return j_full
-
-    def dissipation_matrix(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        batch = state.shape[0]
-        n = self.state_dim
-        r_full = torch.zeros((batch, n, n), dtype=state.dtype, device=state.device)
-        if not self.base_brick.is_matrix_free:
-            r_base = self.base_brick.dissipation_matrix(
-                state[:, : self.base_state_dim], params[:, : self.base_param_dim]
-            )
-            r_full[:, : self.base_state_dim, : self.base_state_dim] = r_base
-        k_damp = torch.clamp(params[:, self.base_param_dim + 2], min=0.0)
-        r_full[:, self.base_state_dim + 1, self.base_state_dim + 1] = k_damp
-        return r_full
-
-    def compute_active_patch_flow(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        k_couple = params[:, self.base_param_dim]
-        zq = state[:, self.base_state_dim]
-        u = torch.zeros_like(state)
-        u[:, self.target_state_index] = k_couple * zq
-        return u
-
-    def external_patch_power(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        e = self.effort(state, params)
-        u = self.compute_active_patch_flow(state, params)
-        return (e * u).sum(dim=-1)
-
-    def flow(
-        self,
-        state: torch.Tensor,
-        params: torch.Tensor,
-        port_inputs: dict[str, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        dx_dt = super().flow(state, params, port_inputs=port_inputs)
-        return dx_dt + self.compute_active_patch_flow(state, params)
-
-
-@dataclass(frozen=True)
-class NonMarkovianMemoryReport:
-    """
-    Diagnostic report testing whether an unexplained residual `r(t)` can be written as a
-    pure Markovian function `g(x(t))` of the observed states or requires an unobserved
-    internal state variable `z(t)`.
-
-    Attributes:
-        is_non_markovian: True when hysteresis or autocorrelated static-fit failure indicates
-                          an unmeasured state variable `z(t)`.
-        hysteresis_ratio: Ratio of residual difference `||r(t_a) - r(t_b)||` at revisited states
-                          `||x(t_a) - x(t_b)|| <= tol` to overall residual standard deviation.
-        static_basis_r2: Best `R^2` achievable by a cubic polynomial basis of observed states `x(t)` alone.
-        residual_lag1_autocorr: Lag-1 temporal autocorrelation of `r(t) - g_static(x(t))`.
-        primary_affected_state: State index exhibiting the strongest non-Markovian residual.
-    """
-
-    is_non_markovian: bool
-    hysteresis_ratio: float
-    static_basis_r2: float
-    residual_lag1_autocorr: float
-    primary_affected_state: int
-
-
-@dataclass(frozen=True)
-class DifferentialResidualInversionReport:
-    """
-    Universal Differential Residual Trajectory Inversion ("The Universal Neptune Inverter"):
-    Reconstructs the hidden state trajectory `z_hat(t)` and unseen perturber dynamics directly
-    from the unexplained vector-field residual `Phi(t) = dx_obs/dt - F_known(x)`:
-      - `reconstructed_latent_trajectory`: `[T, 1]` canonical hidden coordinate `z_hat(t)`
-      - `reconstructed_latent_derivative`: `[T, 1]` time derivative `dz_hat/dt`
-      - `reconstructed_latent_acceleration`: `[T, 1]` second derivative `d2z_hat/dt2`
-      - `dominant_mode_type`: `"relaxation_1d"`, `"oscillatory_2d"`, or `"nonlinear_coupled"`
-      - `discovered_latent_ode_expr`: Symbolic string for the inverted hidden ODE `dz_hat/dt = g(x, z_hat)`
-      - `latent_ode_r2`: `R^2` of the inverted hidden ODE on `dz_hat/dt` (or `d2z_hat/dt2`)
-      - `estimated_3d_line_of_action`: Optional `[T, 3]` unit direction vector `u_hat(t) = Phi_3d / ||Phi_3d||`
-      - `estimated_inverse_square_distance`: Optional `[T]` relative distance profile `||Phi_3d||^(-1/2)`
-    """
-
-    reconstructed_latent_trajectory: torch.Tensor
-    reconstructed_latent_derivative: torch.Tensor
-    reconstructed_latent_acceleration: torch.Tensor
-    dominant_mode_type: str
-    discovered_latent_ode_expr: str
-    latent_ode_r2: float
-    estimated_3d_line_of_action: torch.Tensor | None = None
-    estimated_inverse_square_distance: torch.Tensor | None = None
-
-
-@dataclass(frozen=True)
-class LatentAugmentationResult:
-    """
-    Result of synthesizing and calibrating a `(D + 1)`-state `LatentAugmentedLawBrick`
-    or `(D + 2)`-state `LatentOscillatorAugmentedLawBrick`.
-
-    Attributes:
-        augmented_brick: Compiled `LatentAugmentedLawBrick` or `LatentOscillatorAugmentedLawBrick`.
-        calibrated_params: `[1, P_aug]` calibrated parameter vector.
-        reconstructed_initial_state: `[1, D_aug]` full initial state including latent coordinate(s).
-        trajectory_r2: `R^2` on the observed state trajectory `[T, D]`.
-        latent_ode_r2: `R^2` of the discovered latent ODE.
-        audit_certificate: Layer 1 `AuditCertificate` for `augmented_brick`.
-        latent_mode_type: `"relaxation_1d"` or `"oscillatory_2d"`.
-        residual_inversion_report: `DifferentialResidualInversionReport` from direct residual trajectory inversion.
-    """
-
-    augmented_brick: LatentAugmentedLawBrick | LatentOscillatorAugmentedLawBrick
-    calibrated_params: torch.Tensor
-    reconstructed_initial_state: torch.Tensor
-    trajectory_r2: float
-    latent_ode_r2: float
-    audit_certificate: AuditCertificate
-    latent_mode_type: str = "relaxation_1d"
-    residual_inversion_report: DifferentialResidualInversionReport | None = None
-
-
 @dataclass(frozen=True)
 class ArchetypeFingerprint:
     """
     Universal mathematical archetype classification, differential operator invariants,
     and dimensionless Buckingham-Pi invariants.
-
-    Attributes:
-        archetype_name: Canonical operator class identifier.
-        thermodynamic_slot: Thermodynamic operator slot of the discovered law.
-        parity_symmetry: `"even"`, `"odd"`, or `"asymmetric"` under state inversion `x -> -x`.
-        is_saturating: True if the discovered operator saturates at large state amplitude.
-        dimensionless_groups: Tuple of Layer 1 `DimensionlessGroup` invariants.
-        cross_domain_analogues: Tuple of mathematically isomorphic mechanisms across physics,
-                                chemistry, electrodynamics, and biology.
-        mean_phase_space_divergence: Mean trace of the flow Jacobian `<Tr(dF/dx)>` (Liouville rate).
-        volume_behavior: `"volume_contracting_attractor"`, `"volume_preserving_liouville"`,
-                         or `"volume_expanding_instability"`.
-        max_polynomial_degree: Highest polynomial degree detected in the symbolic AST.
-        coupled_state_pairs: Tuple of interacting state variable name pairs `(x_i, x_j)`.
     """
 
     archetype_name: str
@@ -533,20 +219,6 @@ class ArchetypeFingerprint:
 class ClosedLoopDiscoveryReport:
     """
     Complete end-to-end report from Layer 5 (`discover_and_compile_law`).
-
-    Attributes:
-        discovery_triggered: True if an unmodeled mechanism was required and synthesized.
-        winning_brick: Best compiled `LawBrick` (`ResidualPatchedLawBrick`, `HamiltonianPatchedLawBrick`,
-                       `LatentAugmentedLawBrick`, or `base_brick` if no latent mechanism was needed).
-        winning_params: `[1, P_total]` calibrated and Levenberg-Marquardt polished parameter vector.
-        winning_candidate: Winning `SymbolicCandidate` (or None if latent-augmented or unneeded).
-        pareto_report: `ParetoDiscoveryReport` over the symbolic candidate library.
-        portfolio_rankings: Tuple of `HypothesisRankingEntry` from Layer 4 trajectory competition.
-        memory_report: `NonMarkovianMemoryReport` testing for hidden variables.
-        latent_augmentation: Optional `LatentAugmentationResult` when non-Markovian memory was discovered.
-        archetype: `ArchetypeFingerprint` classifying the universal mathematical structure.
-        audit_certificate: Layer 1 `AuditCertificate` for `winning_brick`.
-        out_of_sample_r2: Horizon extrapolation `R^2` evaluated on the second half of the trajectory.
     """
 
     discovery_triggered: bool
@@ -560,545 +232,6 @@ class ClosedLoopDiscoveryReport:
     archetype: ArchetypeFingerprint
     audit_certificate: AuditCertificate
     out_of_sample_r2: float = 1.0
-
-
-def detect_non_markovian_memory(
-    states: torch.Tensor,
-    residual_flow: torch.Tensor,
-    dt: float = 0.01,
-    state_proximity_quantile: float = 0.08,
-    min_time_separation_steps: int = 3,
-) -> NonMarkovianMemoryReport:
-    """
-    Test whether `residual_flow` (`[T, D]`) is a single-valued function of the observed
-    `states` (`[T, D]`) or exhibits non-Markovian hysteresis / hidden-variable memory.
-    """
-    x = states.detach().to(torch.float64)
-    r = residual_flow.detach().to(torch.float64)
-    t_steps, state_dim = x.shape
-
-    rms_per_state = torch.sqrt(torch.mean(r * r, dim=0))
-    primary_idx = int(torch.argmax(rms_per_state).item()) if state_dim > 0 else 0
-    r_prim = r[:, primary_idx]
-    r_std = float(torch.std(r_prim).item())
-    if r_std <= 1e-10 or t_steps < 8:
-        return NonMarkovianMemoryReport(
-            is_non_markovian=False,
-            hysteresis_ratio=0.0,
-            static_basis_r2=1.0,
-            residual_lag1_autocorr=0.0,
-            primary_affected_state=primary_idx,
-        )
-
-    # 1. Compute pairwise state distance and residual difference for non-adjacent time steps
-    x_scale = torch.clamp(torch.max(x, dim=0).values - torch.min(x, dim=0).values, min=1e-6)
-    x_norm = x / x_scale.unsqueeze(0)
-    dist_x = torch.cdist(x_norm, x_norm, p=2)  # [T, T]
-    diff_r = torch.abs(r_prim.unsqueeze(1) - r_prim.unsqueeze(0))  # [T, T]
-
-    idx_grid = torch.arange(t_steps, device=x.device)
-    time_sep = torch.abs(idx_grid.unsqueeze(1) - idx_grid.unsqueeze(0)) >= min_time_separation_steps
-
-    hysteresis_ratio = 0.0
-    if bool(time_sep.any().item()):
-        sep_dists = dist_x[time_sep]
-        thresh_x = max(float(torch.quantile(sep_dists, state_proximity_quantile).item()), 0.05)
-        close_mask = time_sep & (dist_x <= thresh_x)
-        if bool(close_mask.any().item()):
-            max_close_r_diff = float(torch.quantile(diff_r[close_mask], 0.90).item())
-            hysteresis_ratio = max_close_r_diff / max(r_std, 1e-12)
-
-    # 2. Fit a 3rd-order static polynomial of observed states x(t) and check remaining residual
-    ones = torch.ones((t_steps, 1), dtype=torch.float64, device=x.device)
-    cols = [ones, x, x ** 2, x ** 3]
-    for i in range(state_dim):
-        for j in range(i + 1, state_dim):
-            cols.append((x[:, i] * x[:, j]).unsqueeze(-1))
-    design = torch.cat(cols, dim=-1)
-    sol = torch.linalg.lstsq(design, r_prim.unsqueeze(-1), driver="gelsd").solution.squeeze(-1)
-    r_hat = design @ sol
-    err = r_prim - r_hat
-    ss_res = float(torch.sum(err * err).item())
-    ss_tot = float(torch.sum((r_prim - torch.mean(r_prim)) ** 2).item())
-    static_r2 = max(0.0, 1.0 - ss_res / max(ss_tot, 1e-18))
-
-    # Lag-1 autocorrelation of the unexplained static error e(t)
-    e0 = err[:-1] - torch.mean(err[:-1])
-    e1 = err[1:] - torch.mean(err[1:])
-    denom = float(torch.sqrt(torch.sum(e0 * e0) * torch.sum(e1 * e1)).item())
-    lag1_autocorr = float(torch.sum(e0 * e1).item()) / max(denom, 1e-12) if denom > 1e-12 else 0.0
-
-    # Non-Markovian memory is present when even a cubic static basis fails to explain the residual
-    # (static_r2 < 0.78) while the unexplained error is smooth in time (lag1_autocorr > 0.70)
-    # and exhibits multi-valued hysteresis (hysteresis_ratio > 0.65)
-    is_non_markov = bool(
-        static_r2 < 0.78 and lag1_autocorr > 0.70 and hysteresis_ratio > 0.65
-    )
-
-    static_spec = summarize_singular_spectrum(
-        design,
-        operator_name=f"MarkovianStaticCubicBasis(state={primary_idx})",
-    )
-    emit_trace_node(
-        layer="layer5_discovery",
-        operation="detect_non_markovian_memory",
-        target_name=f"state_{primary_idx}",
-        local_r2=static_r2,
-        decision_margin=abs(hysteresis_ratio - 0.65),
-        selected_branch_id="non_markovian_latent_state" if is_non_markov else "markovian_state_function",
-        selected_expression=(
-            f"is_non_markovian={is_non_markov}, hysteresis={hysteresis_ratio:.3f}, "
-            f"static_r2={static_r2:.4f}, lag1_autocorr={lag1_autocorr:.3f}"
-        ),
-        operator_spectrum=static_spec,
-        metrics={
-            "is_non_markovian": is_non_markov,
-            "hysteresis_ratio": round(hysteresis_ratio, 4),
-            "static_basis_r2": round(static_r2, 6),
-            "residual_lag1_autocorr": round(lag1_autocorr, 4),
-            "primary_affected_state": primary_idx,
-        },
-        skip_if_inner_loop=True,
-    )
-
-    return NonMarkovianMemoryReport(
-        is_non_markovian=is_non_markov,
-        hysteresis_ratio=hysteresis_ratio,
-        static_basis_r2=static_r2,
-        residual_lag1_autocorr=lag1_autocorr,
-        primary_affected_state=primary_idx,
-    )
-
-
-def invert_residual_for_unseen_perturber(
-    base_brick: LawBrick,
-    observed_states: torch.Tensor,
-    residual_flow: torch.Tensor,
-    dt: float,
-    target_state_index: int = 0,
-    latent_name: str = "z_latent",
-    spatial_residual_indices: tuple[int, int, int] | None = None,
-) -> DifferentialResidualInversionReport:
-    """
-    Universal Differential Residual Trajectory Inversion ("The Universal Neptune Inverter"):
-    Directly invert the unexplained vector-field residual `Phi(t) = dx_obs/dt - F_known(x)`
-    to reconstruct the hidden variable trajectory `z_hat(t)`, its time derivatives
-    `(dz_hat/dt, d2z_hat/dt2)`, its governing differential equation `dz_hat/dt = g(x, z_hat)`,
-    and—when 3D spatial force/velocity residuals are present—its 3D line-of-action direction
-    `u_hat(t)` and inverse-square distance profile `r_hat(t) ~ ||Phi_3d(t)||^(-1/2)`.
-    """
-    x = observed_states.detach().to(torch.float64)
-    r = residual_flow.detach().to(torch.float64)
-    t_steps, state_dim = x.shape
-
-    r_target = r[:, target_state_index]
-    r_scale = max(float(torch.max(torch.abs(r_target)).item()), 1e-3)
-    z_traj = (r_target / r_scale).unsqueeze(-1)  # [T, 1]
-    dz_dt = estimate_trajectory_derivatives(z_traj, dt=dt).squeeze(-1)  # [T]
-    d2z_dt2 = estimate_trajectory_derivatives(dz_dt.unsqueeze(-1), dt=dt).squeeze(-1)  # [T]
-
-    # 1. Fit linear + quadratic coupled relaxation basis over (z, x, x^2)
-    ones = torch.ones((t_steps, 1), dtype=torch.float64, device=x.device)
-    lin_design = torch.cat([-z_traj, x, ones], dim=-1)
-    lin_sol = torch.linalg.lstsq(lin_design, dz_dt.unsqueeze(-1), driver="gelsd").solution.squeeze(-1)
-    dz_lin_pred = lin_design @ lin_sol
-    ss_res_lin = float(torch.sum((dz_dt - dz_lin_pred) ** 2).item())
-    ss_tot_dz = float(torch.sum((dz_dt - torch.mean(dz_dt)) ** 2).item())
-    lin_r2 = max(0.0, 1.0 - ss_res_lin / max(ss_tot_dz, 1e-18))
-
-    # 2. Fit 2nd-order harmonic oscillator mode: d2z/dt2 = -omega^2 * z - k_damp * dz/dt
-    osc_design = torch.stack([-z_traj.squeeze(-1), -dz_dt], dim=-1)
-    osc_sol = torch.linalg.lstsq(osc_design, d2z_dt2.unsqueeze(-1), driver="gelsd").solution.squeeze(-1)
-    omega_sq_est = float(osc_sol[0].item())
-    k_damp_est = max(float(osc_sol[1].item()), 0.0)
-    d2z_pred = osc_design @ osc_sol
-    ss_res_osc = float(torch.sum((d2z_dt2 - d2z_pred) ** 2).item())
-    ss_tot_d2z = float(torch.sum((d2z_dt2 - torch.mean(d2z_dt2)) ** 2).item())
-    osc_r2 = max(0.0, 1.0 - ss_res_osc / max(ss_tot_d2z, 1e-18))
-
-    z_sign_changes = int(torch.sum((z_traj[:-1, 0] * z_traj[1:, 0]) < 0.0).item())
-    if (
-        omega_sq_est > 0.05
-        and z_sign_changes >= 2
-        and osc_r2 > 0.85
-        and (osc_r2 > lin_r2 + 0.10 or (osc_r2 > 0.95 and osc_r2 >= lin_r2))
-    ):
-        mode_type = "oscillatory_2d"
-        best_r2 = osc_r2
-        omega_est = math.sqrt(omega_sq_est)
-        ode_str = (
-            f"d2({latent_name})/dt2 = -{omega_sq_est:.4f}*{latent_name} "
-            f"- {k_damp_est:.4f}*d({latent_name})/dt (omega={omega_est:.4f})"
-        )
-    else:
-        mode_type = "relaxation_1d"
-        best_r2 = lin_r2
-        k_dec = max(float(lin_sol[0].item()), 0.05)
-        terms_str = [f"-{k_dec:.4f}*{latent_name}"]
-        for j in range(state_dim):
-            c_j = float(lin_sol[1 + j].item())
-            if abs(c_j) > 1e-3:
-                terms_str.append(f"{c_j:+.4f}*{base_brick.state_specs[j].name}")
-        b_c = float(lin_sol[1 + state_dim].item())
-        if abs(b_c) > 1e-3:
-            terms_str.append(f"{b_c:+.4f}")
-        ode_str = f"d({latent_name})/dt = " + " ".join(terms_str)
-
-    # 3. 3D Line-of-Action & Inverse-Square Distance Triangulation when 3D spatial residual exists
-    line_of_action: torch.Tensor | None = None
-    inv_sq_dist: torch.Tensor | None = None
-    indices_3d = spatial_residual_indices
-    if indices_3d is None and len(base_brick.spatial_nodes_3d) >= 1:
-        node0 = base_brick.spatial_nodes_3d[0]
-        name_to_idx = {sp.name: i for i, sp in enumerate(base_brick.state_specs)}
-        mom_idx = (
-            (
-                name_to_idx[node0.momentum_state_names[0]],
-                name_to_idx[node0.momentum_state_names[1]],
-                name_to_idx[node0.momentum_state_names[2]],
-            )
-            if len(node0.momentum_state_names) == 3 and all(nm in name_to_idx for nm in node0.momentum_state_names)
-            else None
-        )
-        pos_idx = (
-            (
-                name_to_idx[node0.position_state_names[0]],
-                name_to_idx[node0.position_state_names[1]],
-                name_to_idx[node0.position_state_names[2]],
-            )
-            if len(node0.position_state_names) == 3 and all(nm in name_to_idx for nm in node0.position_state_names)
-            else None
-        )
-        if mom_idx is not None and float(torch.linalg.norm(r[:, list(mom_idx)]).item()) > 1e-9:
-            indices_3d = mom_idx
-        elif pos_idx is not None and float(torch.linalg.norm(r[:, list(pos_idx)]).item()) > 1e-9:
-            indices_3d = pos_idx
-        else:
-            indices_3d = mom_idx if mom_idx is not None else pos_idx
-
-    if indices_3d is not None and all(0 <= idx < state_dim for idx in indices_3d):
-        r_3d = torch.stack([r[:, indices_3d[0]], r[:, indices_3d[1]], r[:, indices_3d[2]]], dim=-1)
-        mag_3d = torch.sqrt(torch.sum(r_3d * r_3d, dim=-1, keepdim=True) + 1e-18)
-        line_of_action = r_3d / mag_3d
-        inv_sq_dist = 1.0 / torch.sqrt(mag_3d.squeeze(-1) + 1e-12)
-
-    return DifferentialResidualInversionReport(
-        reconstructed_latent_trajectory=z_traj,
-        reconstructed_latent_derivative=dz_dt.unsqueeze(-1),
-        reconstructed_latent_acceleration=d2z_dt2.unsqueeze(-1),
-        dominant_mode_type=mode_type,
-        discovered_latent_ode_expr=ode_str,
-        latent_ode_r2=best_r2,
-        estimated_3d_line_of_action=line_of_action,
-        estimated_inverse_square_distance=inv_sq_dist,
-    )
-
-
-def discover_latent_state_augmentation(
-    base_brick: LawBrick,
-    observed_states: torch.Tensor,
-    base_params: torch.Tensor,
-    residual_flow: torch.Tensor,
-    dt: float,
-    target_state_index: int = 0,
-    latent_name: str = "z_latent",
-) -> LatentAugmentationResult:
-    """
-    Synthesize and calibrate a `(D + 1)`-state `LatentAugmentedLawBrick` or `(D + 2)`-state
-    `LatentOscillatorAugmentedLawBrick` by first running `invert_residual_for_unseen_perturber`
-    on the unexplained residual `r_target(t)` and then compiling + polishing the augmented system.
-    """
-    inv_rep = invert_residual_for_unseen_perturber(
-        base_brick=base_brick,
-        observed_states=observed_states,
-        residual_flow=residual_flow,
-        dt=dt,
-        target_state_index=target_state_index,
-        latent_name=latent_name,
-    )
-    x = observed_states.detach().to(torch.float64)
-    r = residual_flow.detach().to(torch.float64)
-    t_steps, state_dim = x.shape
-
-    r_target = r[:, target_state_index]
-    r_scale = max(float(torch.max(torch.abs(r_target)).item()), 1e-3)
-    z_traj = inv_rep.reconstructed_latent_trajectory
-    dz_dt = inv_rep.reconstructed_latent_derivative.squeeze(-1)
-
-    # Fit linear relaxation model: dz/dt = -k_decay * z + sum_j c_j * x_j + c_bias
-    ones = torch.ones((t_steps, 1), dtype=torch.float64, device=x.device)
-    design = torch.cat([-z_traj, x, ones], dim=-1)  # [T, 1 + D + 1]
-    sol = torch.linalg.lstsq(design, dz_dt.unsqueeze(-1), driver="gelsd").solution.squeeze(-1)
-
-    k_decay_est = max(float(sol[0].item()), 0.05)
-    state_coeffs = [float(sol[1 + j].item()) for j in range(state_dim)]
-    bias_coeff = float(sol[1 + state_dim].item())
-
-    dz_pred = design @ sol
-    ss_res = float(torch.sum((dz_dt - dz_pred) ** 2).item())
-    ss_tot = float(torch.sum((dz_dt - torch.mean(dz_dt)) ** 2).item())
-    latent_ode_r2 = max(0.0, 1.0 - ss_res / max(ss_tot, 1e-18))
-
-    # Test 2nd-order harmonic oscillator hypothesis: d2z/dt2 = -omega^2 * z - k_damp * dz/dt
-    d2z_dt2 = estimate_trajectory_derivatives(dz_dt.unsqueeze(-1), dt=dt).squeeze(-1)
-    osc_design = torch.stack([-z_traj.squeeze(-1), -dz_dt], dim=-1)
-    osc_sol = torch.linalg.lstsq(osc_design, d2z_dt2.unsqueeze(-1), driver="gelsd").solution.squeeze(-1)
-    omega_sq_est = float(osc_sol[0].item())
-    k_damp_est = max(float(osc_sol[1].item()), 0.0)
-    d2z_pred = osc_design @ osc_sol
-    osc_ss_res = float(torch.sum((d2z_dt2 - d2z_pred) ** 2).item())
-    osc_ss_tot = float(torch.sum((d2z_dt2 - torch.mean(d2z_dt2)) ** 2).item())
-    osc_r2 = max(0.0, 1.0 - osc_ss_res / max(osc_ss_tot, 1e-18))
-
-    sp_target = base_brick.state_specs[target_state_index]
-    flow_unit = sp_target.unit / base_brick.time_unit
-    rate_unit = DIMENSIONLESS / base_brick.time_unit
-
-    p_base_row = base_params[0] if base_params.ndim == 2 else base_params
-    fixed_bounds: dict[str, tuple[float, float]] = {}
-    for idx_p, bp in enumerate(base_brick.param_specs):
-        val = float(p_base_row[idx_p].item())
-        fixed_bounds[bp.name] = (val, val)
-
-    # Check if the hidden state is a 2D conjugate harmonic oscillator (sign changes in z + high osc_r2)
-    z_sign_changes = int(torch.sum((z_traj[:-1, 0] * z_traj[1:, 0]) < 0.0).item())
-    if omega_sq_est > 0.05 and z_sign_changes >= 2 and osc_r2 > max(latent_ode_r2 + 0.10, 0.85):
-        omega_est = math.sqrt(omega_sq_est)
-        zp_traj = dz_dt / max(omega_est, 1e-6)
-        zq_spec = StateVarSpec(
-            name=f"{latent_name}_q",
-            unit=DIMENSIONLESS,
-            default_value=float(z_traj[0, 0].item()),
-            homeostatic_min=-50.0,
-            homeostatic_max=50.0,
-            hard_min=-500.0,
-            hard_max=500.0,
-        )
-        zp_spec = StateVarSpec(
-            name=f"{latent_name}_p",
-            unit=DIMENSIONLESS,
-            default_value=float(zp_traj[0].item()),
-            homeostatic_min=-50.0,
-            homeostatic_max=50.0,
-            hard_min=-500.0,
-            hard_max=500.0,
-        )
-        p_couple_osc = ParamSpec(
-            name="k_latent_couple",
-            unit=flow_unit,
-            default_value=r_scale,
-            min_value=-r_scale * 10.0 - 10.0,
-            max_value=r_scale * 10.0 + 10.0,
-        )
-        p_omega_osc = ParamSpec(
-            name="omega_latent",
-            unit=rate_unit,
-            default_value=omega_est,
-            min_value=max(omega_est * 0.1, 1e-3),
-            max_value=max(omega_est * 10.0, 50.0),
-        )
-        p_damp_osc = ParamSpec(
-            name="k_latent_damp",
-            unit=rate_unit,
-            default_value=k_damp_est,
-            min_value=0.0,
-            max_value=max(k_damp_est * 10.0 + 5.0, 20.0),
-        )
-        osc_brick = LatentOscillatorAugmentedLawBrick(
-            name=f"{base_brick.name}_latent_osc_{latent_name}",
-            base_brick=base_brick,
-            target_state_index=target_state_index,
-            zq_spec=zq_spec,
-            zp_spec=zp_spec,
-            latent_param_specs=(p_couple_osc, p_omega_osc, p_damp_osc),
-        )
-        init_osc = torch.cat([x[0:1], z_traj[0:1], zp_traj[0:1].unsqueeze(-1)], dim=-1)
-        funnel_osc = run_elimination_funnel(
-            brick=osc_brick,
-            observed_states=x,
-            dt=dt,
-            observed_state_indices=list(range(state_dim)),
-            initial_full_state=init_osc,
-            custom_bounds=fixed_bounds,
-            num_initial_samples=48,
-            num_collocation_survivors=12,
-            num_gradient_starts=4,
-            gradient_steps=45,
-            learning_rate=0.03,
-        )
-        emit_trace_node(
-            layer="layer5_discovery",
-            operation="discover_latent_state_augmentation",
-            target_name=osc_brick.name,
-            local_r2=osc_r2,
-            global_r2=funnel_osc.trajectory_r2,
-            decision_margin=abs(osc_r2 - latent_ode_r2),
-            selected_branch_id="oscillatory_2d",
-            selected_expression=f"oscillatory_2d (omega={omega_est:.4f}, R^2={funnel_osc.trajectory_r2:.5f})",
-            alternatives=(
-                AlternativeBranchRecord(
-                    branch_id="relaxation_1d",
-                    expression_or_summary=f"1D relaxation (k_decay={k_decay_est:.4f})",
-                    objective_score=round(1.0 - latent_ode_r2, 6),
-                    local_r2=round(latent_ode_r2, 6),
-                    complexity=2,
-                ),
-            ),
-            metrics={
-                "latent_mode_type": "oscillatory_2d",
-                "latent_ode_r2": round(osc_r2, 6),
-                "trajectory_r2": round(funnel_osc.trajectory_r2, 6),
-            },
-            skip_if_inner_loop=True,
-        )
-        return LatentAugmentationResult(
-            augmented_brick=osc_brick,
-            calibrated_params=funnel_osc.best_params,
-            reconstructed_initial_state=init_osc,
-            trajectory_r2=funnel_osc.trajectory_r2,
-            latent_ode_r2=osc_r2,
-            audit_certificate=funnel_osc.audit_certificate,
-            latent_mode_type="oscillatory_2d",
-            residual_inversion_report=inv_rep,
-        )
-
-    z_spec = StateVarSpec(
-        name=latent_name,
-        unit=DIMENSIONLESS,
-        default_value=float(z_traj[0, 0].item()),
-        homeostatic_min=-50.0,
-        homeostatic_max=50.0,
-        hard_min=-500.0,
-        hard_max=500.0,
-    )
-
-    p_couple = ParamSpec(
-        name="k_latent_couple",
-        unit=flow_unit,
-        default_value=r_scale,
-        min_value=-r_scale * 10.0 - 10.0,
-        max_value=r_scale * 10.0 + 10.0,
-    )
-    p_decay = ParamSpec(
-        name="k_latent_decay",
-        unit=rate_unit,
-        default_value=k_decay_est,
-        min_value=0.0,
-        max_value=max(k_decay_est * 20.0, 50.0),
-    )
-
-    latent_params: list[ParamSpec] = [p_couple, p_decay]
-    drive_terms: list[ExprNode] = []
-
-    # Include state-driven terms with non-trivial magnitude
-    best_j = int(torch.argmax(torch.tensor([abs(c) for c in state_coeffs])).item())
-    for j, c_val in enumerate(state_coeffs):
-        if abs(c_val) > 1e-3 or j == best_j:
-            sp_j = base_brick.state_specs[j]
-            p_drv = ParamSpec(
-                name=f"c_latent_{sp_j.name}",
-                unit=rate_unit / sp_j.unit,
-                default_value=c_val,
-                min_value=-abs(c_val) * 15.0 - 10.0,
-                max_value=abs(c_val) * 15.0 + 10.0,
-            )
-            latent_params.append(p_drv)
-            drive_terms.append(
-                BinaryOpNode(
-                    "*",
-                    SymbolNode(p_drv.name, p_drv.unit, role="param"),
-                    SymbolNode(sp_j.name, sp_j.unit, role="state"),
-                )
-            )
-
-    if abs(bias_coeff) > 1e-3 or not drive_terms:
-        p_bias = ParamSpec(
-            name="c_latent_bias",
-            unit=rate_unit,
-            default_value=bias_coeff,
-            min_value=-abs(bias_coeff) * 15.0 - 10.0,
-            max_value=abs(bias_coeff) * 15.0 + 10.0,
-        )
-        latent_params.append(p_bias)
-        drive_terms.append(SymbolNode(p_bias.name, p_bias.unit, role="param"))
-
-    drive_expr = drive_terms[0]
-    for nxt in drive_terms[1:]:
-        drive_expr = BinaryOpNode("+", drive_expr, nxt)
-
-    coupling_expr = BinaryOpNode(
-        "*",
-        SymbolNode(p_couple.name, p_couple.unit, role="param"),
-        SymbolNode(latent_name, DIMENSIONLESS, role="state"),
-    )
-
-    aug_brick = LatentAugmentedLawBrick(
-        name=f"{base_brick.name}_latent_{latent_name}",
-        base_brick=base_brick,
-        target_state_index=target_state_index,
-        latent_state_spec=z_spec,
-        latent_param_specs=latent_params,
-        coupling_expr=coupling_expr,
-        latent_drive_expr=drive_expr,
-        decay_param_name=p_decay.name,
-    )
-
-    # Freeze base parameters to their already-calibrated values and polish latent parameters + z(0)
-    p_base_row = base_params[0] if base_params.ndim == 2 else base_params
-    fixed_bounds: dict[str, tuple[float, float]] = {}
-    for idx_p, bp in enumerate(base_brick.param_specs):
-        val = float(p_base_row[idx_p].item())
-        fixed_bounds[bp.name] = (val, val)
-
-    init_full = torch.cat([x[0:1], z_traj[0:1]], dim=-1)
-    funnel = run_elimination_funnel(
-        brick=aug_brick,
-        observed_states=x,
-        dt=dt,
-        observed_state_indices=list(range(state_dim)),
-        initial_full_state=init_full,
-        custom_bounds=fixed_bounds,
-        num_initial_samples=48,
-        num_collocation_survivors=12,
-        num_gradient_starts=4,
-        gradient_steps=45,
-        learning_rate=0.03,
-    )
-    emit_trace_node(
-        layer="layer5_discovery",
-        operation="discover_latent_state_augmentation",
-        target_name=aug_brick.name,
-        local_r2=latent_ode_r2,
-        global_r2=funnel.trajectory_r2,
-        decision_margin=abs(latent_ode_r2 - osc_r2),
-        selected_branch_id="relaxation_1d",
-        selected_expression=f"relaxation_1d (dz/dt = -{k_decay_est:.3f}*{latent_name} + {drive_expr.to_infix()})",
-        alternatives=(
-            AlternativeBranchRecord(
-                branch_id="oscillatory_2d",
-                expression_or_summary=f"2D harmonic oscillator (omega_sq={omega_sq_est:.4f})",
-                objective_score=round(1.0 - osc_r2, 6),
-                local_r2=round(osc_r2, 6),
-                complexity=3,
-            ),
-        ),
-        metrics={
-            "latent_mode_type": "relaxation_1d",
-            "latent_ode_r2": round(latent_ode_r2, 6),
-            "trajectory_r2": round(funnel.trajectory_r2, 6),
-        },
-        skip_if_inner_loop=True,
-    )
-
-    return LatentAugmentationResult(
-        augmented_brick=aug_brick,
-        calibrated_params=funnel.best_params,
-        reconstructed_initial_state=init_full,
-        trajectory_r2=funnel.trajectory_r2,
-        latent_ode_r2=latent_ode_r2,
-        audit_certificate=funnel.audit_certificate,
-        residual_inversion_report=inv_rep,
-    )
 
 
 def compile_symbolic_candidate(
@@ -1197,12 +330,22 @@ def _compute_mean_phase_space_divergence(brick: LawBrick) -> tuple[float, str]:
         xb = probes[b : b + 1].detach().requires_grad_(True)
         pb = p_batch[b : b + 1]
         fb = brick.flow(xb, pb)
+        if not fb.requires_grad:
+            traces.append(0.0)
+            continue
         tr_val = 0.0
         for d in range(state_dim):
+            if not fb[0, d].requires_grad:
+                continue
             grad_d = torch.autograd.grad(
-                fb[0, d], xb, retain_graph=(d < state_dim - 1), create_graph=False
+                fb[0, d],
+                xb,
+                retain_graph=(d < state_dim - 1),
+                create_graph=False,
+                allow_unused=True,
             )[0]
-            tr_val += float(grad_d[0, d].item())
+            if grad_d is not None:
+                tr_val += float(grad_d[0, d].item())
         traces.append(tr_val)
     mean_div = sum(traces) / len(traces)
     if abs(mean_div) <= 1e-5:
@@ -1286,7 +429,6 @@ def classify_mathematical_archetype(
         _ast_has_rational_or_saturation(node, state_names) for node in candidate.patch_expressions.values()
     )
 
-    # Extract coupled state variable pairs from AST symbol co-occurrence and target indices
     coupled_pairs_set: set[tuple[str, str]] = set()
     for key, node in candidate.patch_expressions.items():
         syms = sorted(node.free_symbols() & state_names)
@@ -1308,7 +450,6 @@ def classify_mathematical_archetype(
     )
     is_trig = ("sin(" in infix_all) or ("cos(" in infix_all)
 
-    # Probe numerical parity under state inversion x -> -x
     x_probe = torch.full((1, brick.state_dim), 0.73, dtype=torch.float64)
     p_probe = brick.default_params(batch_size=1, dtype=torch.float64)
     if isinstance(brick, ResidualPatchedLawBrick) and slot == "passive_dissipative":
@@ -1402,8 +543,7 @@ def discover_and_compile_law(
 ) -> ClosedLoopDiscoveryReport:
     """
     Execute the complete closed-loop scientific discovery workflow:
-        1. Calibrate `base_brick` parameters and run Layer 1's `UnmodeledResidualGate`
-           (if `calibration_report` is not already supplied).
+        1. Calibrate `base_brick` parameters and run Layer 1's `UnmodeledResidualGate`.
         2. If `not calibration_report.latent_mechanism_required`, return `base_brick` immediately.
         3. Check for non-Markovian hidden-state hysteresis via `detect_non_markovian_memory`;
            if detected, synthesize a `(D + 1)`-state `LatentAugmentedLawBrick`.
@@ -1475,9 +615,6 @@ def discover_and_compile_law(
             f_base_eval = base_brick.flow(x, p_base.expand(x.shape[0], -1)).detach()
             residual_flow = dx - f_base_eval
 
-    # De-bias against Collinear Parameter Compensation: when calibrating an incomplete base model,
-    # tunable linear parameters may shift to extreme bounds to partially absorb a missing nonlinear
-    # dissipative/conservative operator, distorting the residual sign. Check nominal default_params as well.
     p_nom = base_brick.default_params(batch_size=1, dtype=torch.float64, device=x.device)
     if torch.linalg.norm(p_base - p_nom) > 1e-4:
         from cortivra.layer1_axioms.shields import analyze_unexplained_residual as _analyze_res
@@ -1522,7 +659,6 @@ def discover_and_compile_law(
             audit_certificate=cert,
         )
 
-    # Check if non-Markovian memory requires a latent state variable z(t)
     if memory_report.is_non_markovian:
         latent_res = discover_latent_state_augmentation(
             base_brick=base_brick,
@@ -1548,7 +684,6 @@ def discover_and_compile_law(
             audit_certificate=latent_res.audit_certificate,
         )
 
-    # Determine thermodynamic slots to search based on Layer 1 residual signature
     thermo_class = res_analysis.thermodynamic_class
     affected = list(res_analysis.affected_state_indices)
     if thermo_class == "passive_dissipative":
@@ -1587,6 +722,14 @@ def discover_and_compile_law(
                 target_residual=residual_flow,
                 affected_state_indices=affected,
             )
+            extra_cands.extend(
+                discover_fractional_power_and_log_candidates(
+                    brick=base_brick,
+                    states=x,
+                    target_residual=residual_flow,
+                    affected_state_indices=affected,
+                )
+            )
 
         if len(lib.terms) == 0 and not extra_cands:
             continue
@@ -1608,7 +751,6 @@ def discover_and_compile_law(
             primary_pareto_report = rep
         all_pareto_candidates.extend(rep.pareto_front)
 
-    # Select the best candidate from each searched slot first, followed by remaining Pareto candidates
     best_per_slot: list[SymbolicCandidate] = []
     seen_cand_ids: set[str] = set()
     for slot in slots_to_search:
@@ -1629,7 +771,6 @@ def discover_and_compile_law(
     remaining.sort(key=lambda c: (c.bic_score, slot_priority.get(c.thermodynamic_slot, 9)))
     ordered_candidates = best_per_slot + remaining
 
-    # Compile top candidates and run closed-loop trajectory + Levenberg-Marquardt ranking in Layer 4
     compiled_bricks: list[LawBrick] = []
     cand_by_brick_name: dict[str, SymbolicCandidate] = {}
     max_to_compile = max(top_k_to_compile, len(best_per_slot), 1)
@@ -1649,8 +790,6 @@ def discover_and_compile_law(
         compiled_bricks.append(c_brick)
         cand_by_brick_name[c_brick.name] = best_c
 
-    # Jointly calibrate and Levenberg-Marquardt polish both base parameters and newly discovered
-    # patch parameters so any bias introduced when fitting the incomplete base model is removed
     rankings: list[HypothesisRankingEntry] = []
 
     for c_brick in compiled_bricks:
@@ -1672,8 +811,6 @@ def discover_and_compile_law(
             else max(funnel.vector_field_mse, 1e-16)
         )
         cand_obj = cand_by_brick_name[c_brick.name]
-        # Prefer closed-system thermodynamic laws (P_ext == 0) over open-system active_driven patches
-        # when both explain the observed vector field to numerical precision
         structure_bonus = (
             -15.0
             if cand_obj.thermodynamic_slot in ("passive_dissipative", "hamiltonian_potential", "conservative_coupling")
@@ -1700,7 +837,6 @@ def discover_and_compile_law(
     winning_cand = cand_by_brick_name[winning_brick.name]
     arch = classify_mathematical_archetype(winning_brick, candidate=winning_cand, is_latent_augmented=False)
 
-    # Evaluate second-half horizon extrapolation R^2 across all experiment trajectories
     win_params = winner_entry.funnel_report.best_params
     out_of_sample_r2 = winner_entry.funnel_report.trajectory_r2
     if t_steps >= 8:
@@ -1722,7 +858,14 @@ def discover_and_compile_law(
         )
         pred_half = extrap_roll.states
         ss_res = float(torch.sum((gt_half - pred_half) ** 2).item())
-        ss_tot = float(torch.sum((gt_half - torch.mean(gt_half, dim=(0, 1), keepdim=True)) ** 2).item())
+        ss_tot_half = float(
+            torch.sum((gt_half - torch.mean(gt_half, dim=(0, 1), keepdim=True)) ** 2).item()
+        )
+        ss_tot_full = float(
+            torch.sum((x_in - torch.mean(x_in) if x_in.ndim < 3 else (x_in - torch.mean(x_in, dim=(0, 1), keepdim=True))) ** 2).item()
+        ) * (float(gt_half.numel()) / max(float(x_in.numel()), 1.0))
+        ss_tot_energy = 0.05 * float(torch.sum(gt_half**2).item())
+        ss_tot = max(ss_tot_half, 0.25 * ss_tot_full, ss_tot_energy)
         if ss_tot > 1e-15:
             out_of_sample_r2 = 1.0 - ss_res / ss_tot
 
@@ -1778,434 +921,11 @@ def discover_and_compile_law(
     )
 
 
-@dataclass(frozen=True)
-class AutonomousDiscoveryReport:
-    """
-    Result of discovering a complete coupled multi-variable differential equation system
-    from raw trajectory data (`discover_autonomous_symbolic_system`) with zero prior `base_brick`.
-
-    Attributes:
-        compiled_brick: Standalone `CompiledLawBrick` compiled from the discovered symbolic equations.
-        calibrated_params: `[1, P]` calibrated and Levenberg-Marquardt polished parameters.
-        per_state_expressions: Mapping from state variable name to discovered symbolic `dx_i/dt` string.
-        invariant_report: `InvariantDiscoveryReport` of conserved quantities discovered along the trajectory.
-        trajectory_r2: Full trajectory reconstruction `R^2`.
-        vector_field_r2: Vector-field `R^2` across all state variables.
-        archetype: `ArchetypeFingerprint` of the discovered system.
-        audit_certificate: Layer 1 `AuditCertificate` for `compiled_brick`.
-    """
-
-    compiled_brick: CompiledLawBrick
-    calibrated_params: torch.Tensor
-    per_state_expressions: dict[str, str]
-    invariant_report: InvariantDiscoveryReport
-    trajectory_r2: float
-    vector_field_r2: float
-    archetype: ArchetypeFingerprint
-    audit_certificate: AuditCertificate
-
-
-def discover_autonomous_symbolic_system(
-    name: str,
-    domain: str,
-    state_specs: Sequence[StateVarSpec],
-    observed_states: torch.Tensor,
-    dt: float,
-    observed_dx_dt: torch.Tensor | None = None,
-    time_unit: Unit = s,
-    energy_unit: Unit = DIMENSIONLESS,
-    max_polynomial_degree: int = 3,
-    max_terms_per_state: int = 2,
-    include_rational_primitives: bool = True,
-    include_trigonometric: bool = True,
-) -> AutonomousDiscoveryReport:
-    """
-    Discover an entire coupled multi-variable system of differential equations directly from
-    raw trajectory data `observed_states` (`[T, D]` or `[E, T, D]`) without requiring any
-    prior baseline model (`base_brick`), compile it into a standalone `CompiledLawBrick`,
-    extract its conservation invariants, and polish its parameters via Layer 4.
-    """
-    x_in = observed_states.detach().to(torch.float64)
-    state_dim = len(state_specs)
-    if x_in.ndim == 3:
-        num_exps, t_steps, _ = x_in.shape
-        x_flat = x_in.reshape(num_exps * t_steps, state_dim)
-    else:
-        num_exps = 1
-        t_steps, _ = x_in.shape
-        x_flat = x_in
-
-    var_bump_auto = 0.0
-    if observed_dx_dt is not None:
-        dx_in = observed_dx_dt.detach().to(torch.float64)
-        dx_flat = dx_in.reshape(num_exps * t_steps, state_dim) if dx_in.ndim == 3 else dx_in
-    else:
-        noise_std = estimate_trajectory_noise_std(x_in)
-        sig_std = max(float(torch.std(x_in).item()), 1e-12)
-        is_noisy = t_steps >= 9 and noise_std > 0.008 * sig_std and noise_std > 25.0 * (dt**3) * sig_std
-        if is_noisy:
-            var_bump_auto = 0.75
-            x_smooth, dx_in = savitzky_golay_denoise_and_differentiate(x_in, dt=dt)
-            x_flat = x_smooth.reshape(num_exps * t_steps, state_dim) if x_smooth.ndim == 3 else x_smooth
-            dx_flat = dx_in.reshape(num_exps * t_steps, state_dim) if dx_in.ndim == 3 else dx_in
-        elif x_in.ndim == 3:
-            dx_list = [estimate_trajectory_derivatives(x_in[e], dt=dt) for e in range(num_exps)]
-            dx_in = torch.stack(dx_list, dim=0)
-            dx_flat = dx_in.reshape(num_exps * t_steps, state_dim)
-        else:
-            dx_in = estimate_trajectory_derivatives(x_in, dt=dt)
-            dx_flat = dx_in
-
-    # Construct a zero-flow blank-slate LawBrick to host symbol tables and unit inference
-    blank_spec = SymbolicSystemSpec(
-        name=f"{name}_blank_carrier",
-        domain=domain,
-        state_specs=state_specs,
-        param_specs=(),
-        time_unit=time_unit,
-        energy_unit=energy_unit,
-        hamiltonian_expr="0.0",
-    )
-    blank_brick = compile_symbolic_system(blank_spec)
-    empty_params = torch.zeros((1, 0), dtype=torch.float64, device=x_flat.device)
-
-    # 1. Discover any exact algebraic/trigonometric/logarithmic conservation invariants
-    inv_report = discover_conservation_invariants(
-        brick=blank_brick,
-        states=x_flat,
-        flows=dx_flat,
-        max_degree=max_polynomial_degree + 1,
-        include_cross_terms=True,
-        include_trigonometric=include_trigonometric,
-        include_logarithmic=True,
-    )
-
-    # 2. Discover the sparse symbolic equation for each state derivative dx_i/dt
-    discovered_drive_exprs: list[ExprNode] = []
-    all_param_specs: list[ParamSpec] = []
-    seen_p_names: set[str] = set()
-    per_state_str: dict[str, str] = {}
-    last_cand: SymbolicCandidate | None = None
-
-    for idx in range(state_dim):
-        r_single = torch.zeros_like(dx_flat)
-        r_single[:, idx] = dx_flat[:, idx]
-
-        lib_i = generate_symbolic_basis_library(
-            brick=blank_brick,
-            states=x_flat,
-            base_params=empty_params,
-            thermodynamic_slot="active_driven",
-            affected_state_indices=[idx],
-            residual_flow=r_single,
-            max_polynomial_degree=max_polynomial_degree,
-            include_rational_primitives=include_rational_primitives,
-            include_trigonometric=include_trigonometric,
-        )
-        extra_i: list[SymbolicCandidate] = []
-        if include_rational_primitives:
-            extra_i = discover_rational_pade_candidates(
-                brick=blank_brick,
-                states=x_flat,
-                target_residual=r_single,
-                affected_state_indices=[idx],
-            )
-        pareto_i = solve_sparse_pareto_front(
-            library=lib_i,
-            target_residual=r_single,
-            dt=dt,
-            max_active_terms=max_terms_per_state,
-            extra_candidates=extra_i,
-            num_experiments=num_exps,
-            states=x_flat,
-            variational_bump_weight=var_bump_auto,
-        )
-        best_i = pareto_i.best_candidate
-        if best_i is not None and idx in best_i.patch_expressions:
-            node_i = best_i.patch_expressions[idx]
-            discovered_drive_exprs.append(node_i)
-            per_state_str[state_specs[idx].name] = node_i.to_infix()
-            for ps in best_i.param_specs:
-                if ps.name not in seen_p_names:
-                    all_param_specs.append(ps)
-                    seen_p_names.add(ps.name)
-            last_cand = best_i
-        else:
-            zero_node = ConstNode(0.0, state_specs[idx].unit / time_unit)
-            discovered_drive_exprs.append(zero_node)
-            per_state_str[state_specs[idx].name] = "0"
-
-    # 3. Compile standalone CompiledLawBrick and polish all parameters via Layer 4
-    synthesized_spec = SymbolicSystemSpec(
-        name=name,
-        domain=domain,
-        state_specs=state_specs,
-        param_specs=all_param_specs,
-        time_unit=time_unit,
-        energy_unit=energy_unit,
-        hamiltonian_expr="0.0",
-        external_drive_exprs=discovered_drive_exprs,
-    )
-    compiled_brick = compile_symbolic_system(synthesized_spec)
-
-    funnel = run_elimination_funnel(
-        brick=compiled_brick,
-        observed_states=x_in,
-        dt=dt,
-        observed_dx_dt=dx_in,
-        num_initial_samples=48,
-        num_collocation_survivors=12,
-        num_gradient_starts=4,
-        gradient_steps=40,
-    )
-    arch = classify_mathematical_archetype(compiled_brick, candidate=last_cand, is_latent_augmented=False)
-    emit_trace_node(
-        layer="layer5_discovery",
-        operation="discover_autonomous_symbolic_system",
-        target_name=compiled_brick.name,
-        local_error_metric=funnel.vector_field_mse,
-        local_r2=funnel.vector_field_r2,
-        global_error_metric=funnel.trajectory_mse,
-        global_r2=funnel.trajectory_r2,
-        selected_branch_id=compiled_brick.name,
-        selected_expression="; ".join(f"d({k})/dt = {v}" for k, v in per_state_str.items()),
-        metrics={
-            "per_state_expressions": per_state_str,
-            "num_invariants": inv_report.num_invariants,
-            "archetype": arch.archetype_name,
-        },
-        skip_if_inner_loop=True,
-    )
-
-    return AutonomousDiscoveryReport(
-        compiled_brick=compiled_brick,
-        calibrated_params=funnel.best_params,
-        per_state_expressions=per_state_str,
-        invariant_report=inv_report,
-        trajectory_r2=funnel.trajectory_r2,
-        vector_field_r2=funnel.vector_field_r2,
-        archetype=arch,
-        audit_certificate=funnel.audit_certificate,
-    )
-
-
-@dataclass(frozen=True)
-class SymbolicMechanismInventionReport:
-    """
-    End-to-end report from Inverse Symbolic Mechanism Invention (`synthesize_symbolic_feedback_mechanism`):
-        1. Pontryagin adjoint optimal control waveform `u^*(t)` steering `base_brick` to the target.
-        2. Symbolic Pareto regression projecting `u^*(t)` onto closed-form state-feedback laws
-           `u_catalyst(x, theta_new)` (Hill enzymes, Boltzmann switches, diffusive carriers, etc.).
-        3. Autonomous closed-loop `synthesized_brick` verified with zero external input (`u_ext = 0`).
-    """
-
-    synthesized_brick: LawBrick
-    calibrated_params: torch.Tensor
-    invented_candidate: SymbolicCandidate
-    invented_expression: str
-    optimal_control_report: OptimalControlResult
-    baseline_target_loss: float
-    autonomous_closed_loop_loss: float
-    loss_reduction_ratio: float
-    autonomous_trajectory: torch.Tensor
-    viable_across_trajectory: bool
-    max_collateral_drift: float
-    audit_certificate: AuditCertificate
-
-
-def synthesize_symbolic_feedback_mechanism(
-    base_brick: LawBrick,
-    initial_state: torch.Tensor,
-    base_params: torch.Tensor,
-    dt: float,
-    num_steps: int,
-    target_loss_fn: Callable[[torch.Tensor], torch.Tensor],
-    actuated_state_indices: Sequence[int] | None = None,
-    collateral_state_indices: Sequence[int] | None = None,
-    max_collateral_drift: float | None = None,
-    max_control_amplitude: float = 5.0,
-    control_optimization_steps: int = 35,
-    polish_optimization_steps: int = 35,
-) -> SymbolicMechanismInventionReport:
-    """
-    Invent a closed-form symbolic feedback mechanism `u_catalyst(x, theta_new)` when existing
-    parameters `base_params` cannot steer `base_brick` to the target state:
-        1. Solves the Pontryagin adjoint optimal control problem (`solve_optimal_control_waveform`)
-           for the continuous control trajectory `u^*(t)` and controlled state path `x^*(t)`.
-        2. Projects `u^*(t)` along `x^*(t)` onto Layer 5's Dimensionally Constrained Symbolic Basis
-           Library and Rational Padé candidates (`solve_sparse_pareto_front`).
-        3. Compiles the winning symbolic feedback operator into a self-contained `LawBrick`,
-           polishes only the newly invented catalyst parameters `theta_new` via `solve_target_intervention`,
-           and verifies autonomous closed-loop convergence and Layer 1 thermodynamic shields.
-    """
-    x0 = initial_state.detach().to(torch.float64)
-    if x0.ndim == 1:
-        x0 = x0.unsqueeze(0)
-    x0 = x0[:1]
-
-    p_base = base_params.detach().to(torch.float64)
-    if p_base.ndim == 1:
-        p_base = p_base.unsqueeze(0)
-    p_base = p_base[:1]
-
-    act_indices = (
-        tuple(int(i) for i in actuated_state_indices)
-        if actuated_state_indices is not None
-        else tuple(range(base_brick.state_dim))
-    )
-    coll_tol = float(max_collateral_drift) if max_collateral_drift is not None else 0.25
-
-    def _roll_loss_fn(roll_or_traj: object) -> torch.Tensor:
-        if hasattr(roll_or_traj, "states"):
-            return target_loss_fn(getattr(roll_or_traj, "states"))
-        assert isinstance(roll_or_traj, torch.Tensor)
-        return target_loss_fn(roll_or_traj)
-
-    # 1. Compute Pontryagin adjoint optimal control waveform u*(t) and controlled trajectory x*(t)
-    ctrl_res = solve_optimal_control_waveform(
-        brick=base_brick,
-        initial_state=x0,
-        params=p_base,
-        dt=dt,
-        num_steps=num_steps,
-        target_loss_fn=_roll_loss_fn,
-        actuated_state_indices=act_indices,
-        collateral_state_indices=collateral_state_indices,
-        collateral_tolerance_sigma=coll_tol,
-        max_control_amplitude=max_control_amplitude,
-        max_iters=control_optimization_steps,
-    )
-
-    x_star = ctrl_res.controlled_rollout.states[0, :-1].detach()  # [T, D]
-    u_star = ctrl_res.control_waveform[0].detach()  # [T, D]
-
-    # 2. Project u*(t) onto Layer 5's Symbolic Basis Library & Rational Padé candidates along x*(t)
-    lib = generate_symbolic_basis_library(
-        brick=base_brick,
-        states=x_star,
-        base_params=p_base,
-        thermodynamic_slot="active_driven",
-        affected_state_indices=act_indices,
-        residual_flow=u_star,
-        max_polynomial_degree=2,
-        include_rational_primitives=True,
-        include_trigonometric=False,
-    )
-    pade_cands = discover_rational_pade_candidates(
-        brick=base_brick,
-        states=x_star,
-        target_residual=u_star,
-        affected_state_indices=act_indices,
-    )
-    pareto = solve_sparse_pareto_front(
-        library=lib,
-        target_residual=u_star,
-        dt=dt,
-        max_active_terms=2,
-        extra_candidates=pade_cands,
-    )
-    best_cand = pareto.best_candidate
-    if best_cand is None:
-        raise RuntimeError(
-            f"synthesize_symbolic_feedback_mechanism could not find a dimensionally valid candidate for '{base_brick.name}'."
-        )
-
-    # 3. Compile into an autonomous closed-loop LawBrick and polish newly invented parameters theta_new
-    patched_brick = compile_symbolic_candidate(
-        base_brick=base_brick,
-        candidate=best_cand,
-        name_prefix="synthesized_catalyst",
-    )
-    n_base_p = base_brick.param_dim
-    init_full_params = patched_brick.default_params(
-        batch_size=1, dtype=torch.float64, device=p_base.device
-    )
-    if n_base_p > 0:
-        init_full_params[:, :n_base_p] = p_base[:, :n_base_p]
-    new_param_names = [pp.name for pp in patched_brick.param_specs[n_base_p:]]
-
-    if new_param_names:
-        interv_sol = solve_target_intervention(
-            brick=patched_brick,
-            initial_state=x0,
-            baseline_params=init_full_params,
-            dt=dt,
-            num_steps=num_steps,
-            target_loss_fn=_roll_loss_fn,
-            allowed_param_names=new_param_names,
-            collateral_state_indices=collateral_state_indices,
-            collateral_tolerance_sigma=coll_tol,
-            max_iters=polish_optimization_steps,
-            learning_rate=0.08,
-            l2_regularization=1e-5,
-        )
-        polished_params = interv_sol.intervened_params
-        auto_loss = interv_sol.intervened_loss
-        auto_traj = interv_sol.restored_rollout.states
-        viable_ok = bool(interv_sol.restored_rollout.all_time_viable_mask.all().item())
-        col_drift = interv_sol.collateral_max_drift
-    else:
-        polished_params = init_full_params
-        roll = rollout_trajectories(patched_brick, x0, polished_params, dt=dt, num_steps=num_steps)
-        auto_traj = roll.states
-        with torch.no_grad():
-            auto_loss = float(_roll_loss_fn(roll).item())
-        viable_ok = bool(roll.all_time_viable_mask.all().item())
-        col_drift = 0.0
-
-    # If the unpolished least-squares fit already achieved a lower loss than gradient polishing, keep the better one
-    with torch.no_grad():
-        roll_init = rollout_trajectories(patched_brick, x0, init_full_params, dt=dt, num_steps=num_steps)
-        init_cand_loss = float(_roll_loss_fn(roll_init).item())
-        init_cand_viable = bool(roll_init.all_time_viable_mask.all().item())
-        if init_cand_viable and init_cand_loss < auto_loss:
-            polished_params = init_full_params
-            auto_loss = init_cand_loss
-            auto_traj = roll_init.states
-            viable_ok = True
-
-    base_loss = ctrl_res.baseline_loss
-    reduction_ratio = base_loss / max(auto_loss, 1e-12)
-    traj_2d = auto_traj[0] if auto_traj.ndim == 3 else auto_traj
-    p_batch = polished_params.expand(traj_2d.shape[0], -1)
-    cert = audit_law_brick(patched_brick, sample_state=traj_2d, sample_params=p_batch)
-
-    expr_str = "; ".join(
-        f"u_{base_brick.state_specs[idx].name}(x) = {node.to_infix()}"
-        for idx, node in sorted(best_cand.patch_expressions.items())
-    )
-
-    emit_trace_node(
-        layer="layer5_discovery",
-        operation="synthesize_symbolic_feedback_mechanism",
-        target_name=patched_brick.name,
-        local_r2=best_cand.vector_field_r2,
-        global_error_metric=auto_loss,
-        decision_margin=base_loss - auto_loss,
-        selected_branch_id=best_cand.candidate_id,
-        selected_expression=expr_str,
-        metrics={
-            "baseline_target_loss": round(base_loss, 6),
-            "optimal_control_loss": round(ctrl_res.controlled_loss, 6),
-            "autonomous_closed_loop_loss": round(auto_loss, 6),
-            "loss_reduction_ratio": round(reduction_ratio, 4),
-            "invented_expression": expr_str,
-            "passed_audit": cert.passed_all,
-        },
-        skip_if_inner_loop=True,
-    )
-
-    return SymbolicMechanismInventionReport(
-        synthesized_brick=patched_brick,
-        calibrated_params=polished_params,
-        invented_candidate=best_cand,
-        invented_expression=expr_str,
-        optimal_control_report=ctrl_res,
-        baseline_target_loss=base_loss,
-        autonomous_closed_loop_loss=auto_loss,
-        loss_reduction_ratio=reduction_ratio,
-        autonomous_trajectory=auto_traj,
-        viable_across_trajectory=viable_ok,
-        max_collateral_drift=col_drift,
-        audit_certificate=cert,
-    )
+from cortivra.layer5_discovery.autonomous_and_mechanism_synthesis import (
+    AutonomousDiscoveryReport,
+    HelmholtzHodgeDecomposition,
+    SymbolicMechanismInventionReport,
+    decompose_vector_field_helmholtz_hodge,
+    discover_autonomous_symbolic_system,
+    synthesize_symbolic_feedback_mechanism,
+)

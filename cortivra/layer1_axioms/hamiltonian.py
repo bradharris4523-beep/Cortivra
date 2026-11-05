@@ -51,6 +51,10 @@ class StateVarSpec:
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():
             raise ValueError("StateVarSpec name cannot be empty.")
+        if not math.isfinite(self.homeostatic_min) and math.isfinite(self.hard_min):
+            object.__setattr__(self, "homeostatic_min", self.hard_min)
+        if not math.isfinite(self.homeostatic_max) and math.isfinite(self.hard_max):
+            object.__setattr__(self, "homeostatic_max", self.hard_max)
         if self.hard_min > self.hard_max:
             raise ValueError(
                 f"State '{self.name}': hard_min ({self.hard_min}) > hard_max ({self.hard_max})."
@@ -199,6 +203,8 @@ class LawBrick(ABC):
             self.thermal_sink_index = None
         self.thermal_sink_state_name = thermal_sink_state_name
         self.thermal_capacity_scale = float(thermal_capacity_scale)
+        self._hard_bounds_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._param_bounds_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
     def state_dim(self) -> int:
@@ -237,19 +243,27 @@ class LawBrick(ABC):
         return base.expand(batch_size, -1).clone()
 
     def clamp_to_hard_bounds(self, state: torch.Tensor) -> torch.Tensor:
-        device, dtype = state.device, state.dtype
-        mins = torch.tensor([sp.hard_min for sp in self.state_specs], dtype=dtype, device=device)
-        maxs = torch.tensor([sp.hard_max for sp in self.state_specs], dtype=dtype, device=device)
-        return torch.clamp(state, min=mins, max=maxs)
+        key = (state.device, state.dtype)
+        bounds = self._hard_bounds_cache.get(key)
+        if bounds is None:
+            mins = torch.tensor([sp.hard_min for sp in self.state_specs], dtype=state.dtype, device=state.device)
+            maxs = torch.tensor([sp.hard_max for sp in self.state_specs], dtype=state.dtype, device=state.device)
+            bounds = (mins, maxs)
+            self._hard_bounds_cache[key] = bounds
+        return torch.clamp(state, min=bounds[0], max=bounds[1])
 
     def clamp_params(self, params: torch.Tensor) -> torch.Tensor:
         """Clamp parameter tensor `[Batch, ParamDim]` to `[min_value, max_value]` bounds."""
         if not self.param_specs or params.numel() == 0:
             return params
-        device, dtype = params.device, params.dtype
-        mins = torch.tensor([pp.min_value for pp in self.param_specs], dtype=dtype, device=device)
-        maxs = torch.tensor([pp.max_value for pp in self.param_specs], dtype=dtype, device=device)
-        return torch.clamp(params, min=mins, max=maxs)
+        key = (params.device, params.dtype)
+        bounds = self._param_bounds_cache.get(key)
+        if bounds is None:
+            mins = torch.tensor([pp.min_value for pp in self.param_specs], dtype=params.dtype, device=params.device)
+            maxs = torch.tensor([pp.max_value for pp in self.param_specs], dtype=params.dtype, device=params.device)
+            bounds = (mins, maxs)
+            self._param_bounds_cache[key] = bounds
+        return torch.clamp(params, min=bounds[0], max=bounds[1])
 
     def validate_params(self, params: torch.Tensor) -> None:
         """Raise `ValueError` if any parameter in `params` is non-finite or outside `[min_value, max_value]`."""
@@ -486,9 +500,15 @@ class LawBrick(ABC):
         port_inputs: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Compute time derivative `dx/dt` (`[Batch, StateDim]`) in units of `state_unit / time_unit`."""
-        dx_dt = self.conservative_flow(state, params) - self.dissipative_flow(state, params)
+        f_cons = self.conservative_flow(state, params)
+        f_diss = self.dissipative_flow(state, params)
+        dx_dt = f_cons - f_diss
         if self.thermal_sink_index is not None:
-            dx_dt = dx_dt + self.thermal_sink_flow(state, params)
+            e = self.effort(state, params)
+            diss_p = (e * f_diss).sum(dim=-1)
+            th_flow = torch.zeros_like(state)
+            th_flow[:, self.thermal_sink_index] = diss_p * self.thermal_capacity_scale
+            dx_dt = dx_dt + th_flow
         if port_inputs and "external_flow" in port_inputs:
             dx_dt = dx_dt + port_inputs["external_flow"]
         return dx_dt

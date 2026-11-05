@@ -7,8 +7,8 @@ distinct physical domains without any domain-specific hardcoding or oracle hints
     1. `excitable_bioelectrical_and_collateral_cure`: Blind discovery of an unmodeled nonlinear
        membrane conductance / clearance channel from trajectory data + collateral-shielded
        restorative intervention + Lyapunov basin certification.
-    2. `celestial_3d_unseen_perturber_inversion`: Blind 3D orbital residual inversion (Le Verrier
-       Neptune test) recovering the 3D line-of-action vector and inverse-square distance proxy of
+    2. `celestial_3d_unseen_perturber_inversion`: Blind 3D orbital residual inversion
+       recovering the 3D line-of-action vector and inverse-square distance proxy of
        an unseen perturbing body, plus Hamiltonian potential patching.
     3. `locked_pathway_autonomous_catalyst_invention`: A locked biochemical pathway (`tunable=False`
        on all baseline parameters) where parameter shifts are impossible, forcing
@@ -86,6 +86,19 @@ class BlindReconstructionBenchmarkResult:
     metrics: dict[str, Any]
     dossier: ScientificDiscoveryDossier | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "benchmark_id": self.benchmark_id,
+            "domain": self.domain,
+            "passed": self.passed,
+            "reconstruction_r2": round(float(self.reconstruction_r2), 6),
+            "target_loss_reduction_ratio": round(float(self.target_loss_reduction_ratio), 4),
+            "lyapunov_basin_radius": round(float(self.lyapunov_basin_radius), 4),
+            "passed_falsification": self.passed_falsification,
+            "discovered_symbolic_law": self.discovered_symbolic_law,
+            "metrics": self.metrics,
+        }
+
 
 @dataclass(frozen=True)
 class BlindReconstructionSuiteReport:
@@ -98,6 +111,16 @@ class BlindReconstructionSuiteReport:
     num_total: int
     mean_reconstruction_r2: float
     results: tuple[BlindReconstructionBenchmarkResult, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "passed_all": self.passed_all,
+            "num_passed": self.num_passed,
+            "num_total": self.num_total,
+            "pass_rate": round(self.num_passed / max(self.num_total, 1), 4),
+            "mean_reconstruction_r2": round(float(self.mean_reconstruction_r2), 6),
+            "results": [r.to_dict() for r in self.results],
+        }
 
 
 def run_benchmark_excitable_bioelectrical_and_collateral_cure() -> BlindReconstructionBenchmarkResult:
@@ -230,7 +253,7 @@ def run_benchmark_excitable_bioelectrical_and_collateral_cure() -> BlindReconstr
 
 def run_benchmark_celestial_3d_unseen_perturber_inversion() -> BlindReconstructionBenchmarkResult:
     """
-    Benchmark 2 (Astrophysics / 3D Orbital Mechanics — Le Verrier Neptune Test):
+    Benchmark 2 (Astrophysics / 3D Orbital Mechanics — 3D Perturber Inversion):
     A 3D spacecraft/planet experiences an unmodeled gravitational perturbation along a known
     3D direction vector `(0.6, 0.8, 0.0)` and an unmodeled quartic central potential `0.25 * alpha * q_x^4`.
     Cortivra must:
@@ -716,3 +739,6 @@ def run_blind_scientific_reconstruction_suite() -> BlindReconstructionSuiteRepor
         mean_reconstruction_r2=mean_r2,
         results=benchmarks,
     )
+
+
+run_all_blind_reconstruction_benchmarks = run_blind_scientific_reconstruction_suite

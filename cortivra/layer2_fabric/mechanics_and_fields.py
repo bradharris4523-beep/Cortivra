@@ -5,7 +5,7 @@ Provides:
     - `CentralForceHamiltonianBrick`: N-body gravitational / Coulomb / power-law central-force
       system `H(q, p) = sum ||p_i||^2 / (2*m_i) + 0.5 * sum_{i!=j} alpha_{ij} / ||q_i - q_j||^p`.
       Supports orbital mechanics, Keplerian conservation, and unmodeled gravitational
-      perturbation discovery (e.g., Uranus-to-Neptune residual analysis).
+      perturbation discovery (3D orbital residual inversion).
     - `NonlinearPendulumAndViscoelasticBrick`: Trigonometric pendulum / Josephson / Kuramoto
       oscillator combined with Hookean/Kelvin-Voigt viscoelasticity and optional active force input.
 """

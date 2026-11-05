@@ -1,17 +1,107 @@
-Copyright (c) 2026 Brad Harris. All rights reserved.
+GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
 
-CORTIVRA — SOURCE-AVAILABLE RESEARCH & EVALUATION LICENSE
+Copyright (c) 2026 Cortivra Authors. All Rights Reserved.
 
-Permission is hereby granted to view, inspect, execute, and evaluate this software
-and associated documentation files (the "Software") for academic research,
-non-commercial scientific verification, and official evaluation in the Meta Global
-AI Developer Hackathon.
+================================================================================
+COMMERCIAL & SOVEREIGN IP RESERVATION NOTICE
+================================================================================
+Cortivra is dual-licensed under:
+1. The GNU Affero General Public License v3.0 (AGPL-3.0) for open-source academic,
+   research, and hackathon evaluation use. Under AGPL-3.0 Section 13, any entity
+   that deploys, hosts, or interacts with a modified or unmodified version of
+   Cortivra over a computer network (including SaaS, API, or internal cloud
+   deployment) MUST make the complete Corresponding Source code of their entire
+   derivative system publicly available under AGPL-3.0 and preserve all copyright,
+   cryptographic provenance, and attribution notices.
+2. A separate Commercial Enterprise License from the copyright holder for any
+   proprietary, closed-source, or commercial deployment without AGPL-3.0 copyleft
+   obligations.
 
-Commercial redistribution, proprietary relicensing, or commercial deployment of the
-Universal Port-Hamiltonian Kernel, Symbolic-to-Tensor Compiler, Cascading Elimination
-Engine, or Crystallized Law Vault without explicit prior written permission from the
-copyright holder is strictly prohibited.
+Unauthorized removal of copyright notices, re-branding, or closed-source commercial
+redistribution of Cortivra's 6-layer Port-Hamiltonian compiler, IEEE-754 interval
+verification engine, SVD nullspace control solvers, or 3-stage physical realization
+pipeline is strictly prohibited.
+================================================================================
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
-INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT.
+                    GNU AFFERO GENERAL PUBLIC LICENSE
+                       Version 3, 19 November 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU Affero General Public License is a free, copyleft license for
+software and other kinds of works, specifically designed to ensure
+cooperation with the community in the case of network server software.
+
+  When you distribute copies of such a program, whether gratis or for a
+fee, you must pass on to the recipients the same freedoms that you
+received. You must make sure that they, too, receive or can get the
+source code. And you must show them these terms so they know their
+rights.
+
+  Developers that use the GNU Affero General Public License protect your
+rights with two steps: (1) assert copyright on the software, and (2)
+offer you this License which gives you legal permission to copy,
+distribute and/or modify the software.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+  "This License" refers to version 3 of the GNU Affero General Public License.
+  "The Program" refers to any copyrightable work licensed under this License.
+
+  2. Basic Permissions.
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.
+
+  4. Conveying Verbatim Copies.
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  5. Conveying Modified Source Versions.
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+    b) The work must carry prominent notices stating that it is
+    released under this License.
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.
+
+  13. Remote Network Interaction; Use with the GNU General Public License.
+  Notwithstanding any other provision of this License, if you modify the
+Program, your modified version must prominently offer all users
+interacting with it remotely through a computer network (if your version
+supports such interaction) an opportunity to receive the Corresponding
+Source of your version by providing access to the Corresponding Source
+from a network server at no charge, through some standard or customary
+means of facilitating copying of software.
+
+  15. Disclaimer of Warranty.
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW. EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.
+
+  16. Limitation of Liability.
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM.
+
+Full statutory text of the GNU Affero General Public License v3.0:
+https://www.gnu.org/licenses/agpl-3.0.txt

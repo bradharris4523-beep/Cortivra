@@ -9,6 +9,7 @@ import contextvars
 import hashlib
 import json
 import math
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -312,8 +313,12 @@ class FlightRecorder:
         self._on_node_recorded = on_node_recorded
         self._span_stack: list[str] = []
         self._last_completed_node_id: str | None = None
+        self._session_start_ns: int = time.perf_counter_ns()
+        self._last_node_ts_ns: int = self._session_start_ns
         self._counter: int = 0
         self._inner_loop_depth: int = 0
+        self._tls = threading.local()
+        self._lock = threading.RLock()
 
     @classmethod
     @contextmanager
@@ -336,15 +341,17 @@ class FlightRecorder:
 
     @property
     def in_inner_loop(self) -> bool:
-        return self._inner_loop_depth > 0
+        tls_depth = getattr(self._tls, "depth", 0)
+        return (self._inner_loop_depth + tls_depth) > 0
 
     @contextmanager
     def suppress_inner_loop(self) -> Iterator[None]:
-        self._inner_loop_depth += 1
+        cur = getattr(self._tls, "depth", 0)
+        self._tls.depth = cur + 1
         try:
             yield
         finally:
-            self._inner_loop_depth = max(0, self._inner_loop_depth - 1)
+            self._tls.depth = max(0, getattr(self._tls, "depth", 1) - 1)
 
     def _next_node_id(self, layer: LayerId, operation: str) -> str:
         self._counter += 1
@@ -355,8 +362,10 @@ class FlightRecorder:
         if explicit_parents:
             return tuple(explicit_parents)
         parents: list[str] = []
-        if self._last_completed_node_id:
-            parents.append(self._last_completed_node_id)
+        tls_parent = getattr(self._tls, "last_node_id", None)
+        last_id = tls_parent if tls_parent is not None else self._last_completed_node_id
+        if last_id:
+            parents.append(last_id)
         if self._span_stack and self._span_stack[-1] not in parents:
             parents.append(self._span_stack[-1])
         return tuple(parents)
@@ -382,52 +391,63 @@ class FlightRecorder:
         diagnostics: Sequence[str] = (),
         parent_ids: Sequence[str] | None = None,
     ) -> CausalTraceNode:
-        node = CausalTraceNode(
-            node_id=self._next_node_id(layer, operation),
-            parent_ids=self._resolve_parent_ids(parent_ids),
-            layer=layer,
-            operation=operation,
-            target_name=target_name,
-            started_at_ns=time.perf_counter_ns(),
-            duration_ms=round(float(duration_ms), 3),
-            status=status,
-            local_error_metric=(
-                round(float(local_error_metric), 8)
-                if (local_error_metric is not None and math.isfinite(local_error_metric))
-                else local_error_metric
-            ),
-            local_r2=(
-                round(float(local_r2), 6)
-                if (local_r2 is not None and math.isfinite(local_r2))
-                else local_r2
-            ),
-            global_error_metric=(
-                round(float(global_error_metric), 8)
-                if (global_error_metric is not None and math.isfinite(global_error_metric))
-                else global_error_metric
-            ),
-            global_r2=(
-                round(float(global_r2), 6)
-                if (global_r2 is not None and math.isfinite(global_r2))
-                else global_r2
-            ),
-            physical_violation_metric=round(float(physical_violation_metric), 8)
-            if math.isfinite(physical_violation_metric)
-            else float("inf"),
-            decision_margin=(
-                round(float(decision_margin), 6)
-                if (decision_margin is not None and math.isfinite(decision_margin))
-                else decision_margin
-            ),
-            selected_branch_id=selected_branch_id,
-            selected_expression=selected_expression,
-            operator_spectrum=operator_spectrum,
-            alternatives=tuple(alternatives),
-            metrics=dict(metrics) if metrics else {},
-            diagnostics=tuple(diagnostics),
-        )
-        self.dag.add_node(node)
-        self._last_completed_node_id = node.node_id
+        with self._lock:
+            now_ns = time.perf_counter_ns()
+            prev_ns = getattr(self._tls, "last_ts_ns", self._last_node_ts_ns)
+            self._tls.last_ts_ns = now_ns
+            self._last_node_ts_ns = now_ns
+            eff_duration_ms = (
+                float(duration_ms)
+                if float(duration_ms) > 0.0
+                else max((now_ns - prev_ns) / 1e6, 0.05)
+            )
+            node = CausalTraceNode(
+                node_id=self._next_node_id(layer, operation),
+                parent_ids=self._resolve_parent_ids(parent_ids),
+                layer=layer,
+                operation=operation,
+                target_name=target_name,
+                started_at_ns=now_ns,
+                duration_ms=round(eff_duration_ms, 3),
+                status=status,
+                local_error_metric=(
+                    round(float(local_error_metric), 8)
+                    if (local_error_metric is not None and math.isfinite(local_error_metric))
+                    else local_error_metric
+                ),
+                local_r2=(
+                    round(float(local_r2), 6)
+                    if (local_r2 is not None and math.isfinite(local_r2))
+                    else local_r2
+                ),
+                global_error_metric=(
+                    round(float(global_error_metric), 8)
+                    if (global_error_metric is not None and math.isfinite(global_error_metric))
+                    else global_error_metric
+                ),
+                global_r2=(
+                    round(float(global_r2), 6)
+                    if (global_r2 is not None and math.isfinite(global_r2))
+                    else global_r2
+                ),
+                physical_violation_metric=round(float(physical_violation_metric), 8)
+                if math.isfinite(physical_violation_metric)
+                else float("inf"),
+                decision_margin=(
+                    round(float(decision_margin), 6)
+                    if (decision_margin is not None and math.isfinite(decision_margin))
+                    else decision_margin
+                ),
+                selected_branch_id=selected_branch_id,
+                selected_expression=selected_expression,
+                operator_spectrum=operator_spectrum,
+                alternatives=tuple(alternatives),
+                metrics=dict(metrics) if metrics else {},
+                diagnostics=tuple(diagnostics),
+            )
+            self.dag.add_node(node)
+            self._last_completed_node_id = node.node_id
+            self._tls.last_node_id = node.node_id
         if self._on_node_recorded is not None:
             self._on_node_recorded(node)
         return node
@@ -544,14 +564,36 @@ def record_simulation_activity(
     rec = _ACTIVE_RECORDER.get()
     if rec is None:
         return
-    c = rec.dag.simulation_counters
-    c.ode_rollout_calls += int(ode_rollout_calls)
-    c.trajectories_integrated += int(trajectories_integrated)
-    c.integration_steps_executed += int(integration_steps_executed)
-    c.sobol_qmc_universes_sampled += int(sobol_qmc_universes_sampled)
-    c.newton_jacobian_solves += int(newton_jacobian_solves)
-    c.adjoint_gradient_passes += int(adjoint_gradient_passes)
-    c.stochastic_langevin_trajectories += int(stochastic_langevin_trajectories)
-    if integrator:
-        c.integrator_usage[integrator] = c.integrator_usage.get(integrator, 0) + 1
+    with rec._lock:
+        c = rec.dag.simulation_counters
+        c.ode_rollout_calls += int(ode_rollout_calls)
+        c.trajectories_integrated += int(trajectories_integrated)
+        c.integration_steps_executed += int(integration_steps_executed)
+        c.sobol_qmc_universes_sampled += int(sobol_qmc_universes_sampled)
+        c.newton_jacobian_solves += int(newton_jacobian_solves)
+        c.adjoint_gradient_passes += int(adjoint_gradient_passes)
+        c.stochastic_langevin_trajectories += int(stochastic_langevin_trajectories)
+        if integrator:
+            c.integrator_usage[integrator] = c.integrator_usage.get(integrator, 0) + 1
+
+
+def submit_with_recorder(pool: Any, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """
+    Submit `fn(*args, **kwargs)` to a `ThreadPoolExecutor` while propagating the current
+    ambient `contextvars` context (including `_ACTIVE_RECORDER`) and seeding thread-local
+    parent & timestamp anchors from the fork point.
+    """
+    rec = _ACTIVE_RECORDER.get()
+    fork_parent_id = rec._last_completed_node_id if rec is not None else None
+    fork_ts_ns = time.perf_counter_ns()
+    ctx = contextvars.copy_context()
+
+    def _wrapped() -> Any:
+        active = _ACTIVE_RECORDER.get()
+        if active is not None:
+            active._tls.last_node_id = fork_parent_id
+            active._tls.last_ts_ns = fork_ts_ns
+        return fn(*args, **kwargs)
+
+    return pool.submit(ctx.run, _wrapped)
 
