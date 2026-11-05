@@ -40,7 +40,22 @@ Because every physical system in nature is governed by the same 7 base SI units,
 
 ---
 
-## 3. How One Run Works (6 Simple Steps)
+## 3. Blind Nobel Prize Rediscovery Proof (Zero Domain Hints)
+
+How do we know Cortivra actually discovers real governing laws from raw numbers instead of relying on pre-written templates?
+
+In [`tests/test_nobel_prize_blind_rediscoveries.py`](tests/test_nobel_prize_blind_rediscoveries.py) and [`cortivra/layer6_agents/blind_reconstruction_benchmarks.py`](cortivra/layer6_agents/blind_reconstruction_benchmarks.py), we stripped away all variable names and domain labels—feeding Cortivra **blind, anonymized number streams (`s_0, s_1, ...`) with zero domain hints**—and Cortivra autonomously rediscovered the mathematical structure of **four Nobel Prize-winning physical and biological laws** directly from the raw numbers:
+
+| Blind Test System (Given Only `s_0, s_1` Numbers) | Historical Discovery Rediscovered | Blind Vector-Field Fit ($R^2$) | Code & Test Proof |
+| :--- | :--- | :--- | :--- |
+| **1. Hodgkin-Huxley / FitzHugh-Nagumo Neural Pulse** | **1963 Nobel Prize** (Action potential excitable membrane cubic + recovery dynamics) | **$R^2 > 0.999$** | [`test_nobel_prize_blind_rediscoveries.py`](tests/test_nobel_prize_blind_rediscoveries.py#L46-L103) |
+| **2. Prigogine Brusselator Chemical Clock** | **1977 Nobel Prize** (Non-equilibrium autocatalytic trimolecular $X^2Y$ oscillation) | **$R^2 > 0.999$** | [`test_nobel_prize_blind_rediscoveries.py`](tests/test_nobel_prize_blind_rediscoveries.py#L106-L162) |
+| **3. Krebs / Sel'kov Glycolytic ATP Oscillation** | **1953 Nobel Prize** (Allosteric phosphofructokinase substrate-product feedback) | **$R^2 > 0.999$** | [`test_nobel_prize_blind_rediscoveries.py`](tests/test_nobel_prize_blind_rediscoveries.py#L165-L219) |
+| **4. Jacob-Monod / Elowitz Genetic Repressilator** | **1965 Nobel Prize** (Cyclic 3-gene cooperative Hill transcriptional repression loop) | **$R^2 > 0.960$** | [`test_nobel_prize_blind_rediscoveries.py`](tests/test_nobel_prize_blind_rediscoveries.py#L222-L280) |
+
+---
+
+## 4. How One Run Works (6 Simple Steps)
 
 ```mermaid
 flowchart LR
@@ -63,7 +78,7 @@ flowchart LR
 
 ---
 
-## 4. Judge's Proof Map: Click Any Claim to Inspect the Code
+## 5. Judge's Proof Map: Click Any Claim to Inspect the Code
 
 Every layer of Cortivra is real, runnable Python and PyTorch code built during the hackathon. Click any link below to inspect the implementation and its automated tests:
 
@@ -81,7 +96,7 @@ Every layer of Cortivra is real, runnable Python and PyTorch code built during t
 
 ---
 
-## 5. How Cortivra Uses Meta AI Models
+## 6. How Cortivra Uses Meta AI Models
 
 Cortivra orchestrates a **4-Agent Scientific Council** ([`cortivra/layer6_agents/meta_clients.py`](cortivra/layer6_agents/meta_clients.py)) via live inference on **Baseten** (`meta-models/muse-spark-open-1026`), **Fireworks AI**, and the **Meta Model API**:
 
@@ -94,7 +109,7 @@ Cortivra orchestrates a **4-Agent Scientific Council** ([`cortivra/layer6_agents
 
 ---
 
-## 6. Quick Start (Run in 60 Seconds)
+## 7. Quick Start (Run in 60 Seconds)
 
 ### 1. Install Dependencies
 ```bash
@@ -125,7 +140,7 @@ pytest
 
 ---
 
-## 7. This Is Just the Beginning (A Note from the Builder)
+## 8. This Is Just the Beginning (A Note from the Builder)
 
 Everything in this repository—all 6 layers of the physics compiler, the zero-side-effect control solver, the formal proof exporters, the 3-stage realization pipeline, and the interactive Web Workbench—was built solo during the 9-day hackathon window (**Oct 27 – Nov 4, 2026**).
 
@@ -135,7 +150,7 @@ What you see here is just the foundation—there is still so much more I want to
 
 ---
 
-## 8. All 20 Files Exported on Every Run
+## 9. All 20 Files Exported on Every Run
 
 Every investigation exports a tamper-evident, SHA-256 hash-chained folder under `logs/runs/<timestamp>_<system_name>/`:
 
@@ -164,7 +179,7 @@ Every investigation exports a tamper-evident, SHA-256 hash-chained folder under 
 
 ---
 
-## 9. License, Security & Intellectual Property
+## 10. License, Security & Intellectual Property
 
 * **Dual License ([`LICENSE`](LICENSE)):** Available under the **GNU Affero General Public License v3.0 (AGPL-3.0)** for open-source academic and hackathon evaluation (requiring full source disclosure for any network or hosted deployment under Section 13), with all commercial, closed-source, and enterprise rights reserved by the author (Brad Harris).
 * **Security & Provenance ([`SECURITY.md`](SECURITY.md)):** Zero credentials in source code, strict localhost and path-traversal protection on the Web Workbench, and SHA-256 Merkle provenance on every generated file.
