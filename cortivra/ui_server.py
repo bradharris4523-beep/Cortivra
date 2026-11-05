@@ -1034,9 +1034,10 @@ class WorkbenchRequestHandler(BaseHTTPRequestHandler):
                             },
                         )
 
+                    req_domain = str(req_data.get("domain") or "multiphysics").strip() or "multiphysics"
                     dossier = council.investigate(
                         prompt=prompt,
-                        domain="multiphysics",
+                        domain=req_domain,
                         dt=0.02,
                         num_steps=num_steps,
                         max_council_steps=max_council_steps,
@@ -1522,7 +1523,7 @@ def _answer_dossier_chat_question(
                 require_json=False,
             )
         )
-        raw_ans = str(resp.raw_text or "").strip()
+        raw_ans = str(getattr(resp, "raw_content", "") or getattr(resp, "raw_text", "") or "").strip()
         if raw_ans.startswith("{") and resp.parsed_json and isinstance(resp.parsed_json, dict):
             raw_ans = str(
                 resp.parsed_json.get("answer")
