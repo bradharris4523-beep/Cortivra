@@ -1,6 +1,6 @@
 # Cortivra
 
-**Turn a one-sentence engineering question or raw sensor CSV into verified differential equations, zero-side-effect control laws, formal computer proofs, 3D CAD hardware, and runnable C99 firmware.**
+**Turn a one-sentence scientific question or raw sensor CSV into verified governing equations, zero-side-effect control strategies, formal computer proofs, 3D CAD hardware, and runnable C99 code.**
 
 > **Built for the Meta Global AI Developer Hackathon (`Push the Frontier` Track | Oct 27 – Nov 4, 2026)**
 >
@@ -10,84 +10,98 @@
 
 ## 1. The Goal (In Plain English)
 
-When engineers and scientists try to fix or control a real physical system—like stopping lithium dendrites in a fast-charging battery, stabilizing plasma in a fusion reactor, optimizing a chemical reactor, or clearing toxic proteins in a biophysical model—they hit **two walls**:
+Whenever engineers and scientists try to fix or control a complex physical system—whether that is a fast-charging battery, a fusion reactor, a chemical plant, a spacecraft thruster, or a cellular pathway—they run into **two fundamental problems**:
 
-1. **Everything is connected (The Side-Effect Problem):** Pushing a single lever to fix your main target almost always spills over and damages healthy neighboring parts of the system.
-2. **Standard AI models guess text instead of obeying physics:** If you ask a standard language model for equations or control settings, it can invent numbers that violate conservation of energy, mix up physical units (like adding meters to seconds), or blow up over time.
+1. **The Side-Effect Problem (Everything Is Connected):** In any real system, all the parts are coupled together. When you push a single lever hard enough to fix your main target, the force spills over and damages healthy neighboring parts.
+2. **Standard AI Guesses Text Instead of Obeying Physics:** If you ask a standard AI chatbot how to control a physical system, it predicts plausible-sounding words. It does not check if its equations conserve energy, if the physical units match (like accidentally adding meters to seconds), or if the system will spiral out of control over time.
 
 **Cortivra was built to solve both problems.**
 
-Instead of letting an AI guess the final answer in plain text, Cortivra pairs **Meta's Muse AI models** with a **6-layer deterministic physics and math compiler**:
-* **Meta's AI models** translate your question into a structured physical hypothesis and choose which mathematical tools to run next.
-* **Cortivra's math engine** checks every equation against **7-dimensional SI units** ($\text{kg, m, s, A, K, mol, cd}$) and the **First and Second Laws of Thermodynamics**. If the AI makes a unit or energy mistake, the compiler catches the exact error and forces the AI to repair the equation until the math is 100% sound.
-* Once the equations are verified, Cortivra solves for a **coordinated combination of levers** that fixes the primary target while mathematically canceling out spillover into neighboring parts—and compiles the solution into **20 real engineering files** (formal proofs, 3D printable `.stl`/`.obj` CAD, `.svg` blueprints, compilable `C99` microcontroller code, a 4-stage reactor recipe, candidate molecular structures, and a standalone Python simulator).
+Cortivra connects **Meta's Muse AI models** to a **6-layer deterministic physics and math compiler**:
+* **Meta's AI models** read your question (or sensor data), propose how the parts of the system interact, and choose which mathematical tools to run.
+* **Cortivra's physics compiler** refuses to trust raw AI text. It checks every equation against the **7 base units of physics** ($\text{kg, m, s, A, K, mol, cd}$) and the **laws of energy and heat**. If the AI makes a unit or energy mistake, the compiler catches the exact error and forces the AI to fix the math before moving forward.
+* Once the equations are verified, Cortivra calculates a **coordinated multi-lever solution** that fixes the main target while mathematically canceling out spillover onto healthy neighbors—and automatically compiles **20 ready-to-use engineering files** (computer-checked proofs, 3D printable `.stl`/`.obj` hardware meshes, `.svg` blueprints, compilable `C99` microcontroller code, a 4-stage lab reactor recipe, candidate molecular structures, and a standalone Python simulator).
 
 > *Simulation & Safety Scope: Cortivra is an in-silico mathematical physics, materials, and dynamical-systems simulation and verification workbench for R&D engineers and physical scientists. It does not generate or provide clinical or medical advice.*
 
 ---
 
-## 2. How One Investigation Works (Step by Step)
+## 2. One Engine Across Every Department of Science
+
+Because every physical system in nature is governed by the same 7 base SI units, conservation of energy, and rates of change, **the exact same Cortivra engine works across every department of science and engineering**:
+
+| Department / Field | Example Problem You Can Give Cortivra | What Cortivra Solves & Protects |
+| :--- | :--- | :--- |
+| **Energy & Batteries** | *"Stop lithium dendrite growth during fast charging in a solid-state battery."* | Suppresses dendrite short-circuits while keeping bulk ion flow high and preventing thermal runaway. |
+| **Fusion & Aerospace** | *"Calm plasma edge instabilities in a fusion tokamak or acoustic vibrations in a rocket nozzle."* | Damps violent edge oscillations without cooling down the core plasma or losing thrust. |
+| **Chemistry & Manufacturing** | *"Maximize product yield in a continuous-flow reactor while blocking toxic side-reactions."* | Computes a 4-stage temperature, feed, catalyst, and cooling schedule that keeps side-impurities under $1\%$. |
+| **Materials & Quantum** | *"Design a porous 3D support lattice or cryogenic resonator that resists buckling and heat loss."* | Solves for the exact 3D unit-cell geometry (like a Schoen Gyroid lattice) and material thickness. |
+| **Biophysics & Cellular R&D** | *"Restore healthy electrical or protein balance in a simulated cell network without off-target toxicity."* | Finds the multi-lever intervention that restores the target state while keeping neighboring compartments inside safe limits. |
+
+---
+
+## 3. How One Run Works (6 Simple Steps)
 
 ```mermaid
 flowchart LR
-    A["1. Your Question or Sensor CSV"] --> B["2. Meta Muse 4-Agent Council"]
-    B --> C["3. 7D SI Unit & Energy Compiler"]
-    C --> D["4. Equation Discovery & Blind 30%->70% Test"]
-    D --> E["5. Zero-Side-Effect Control Solver"]
-    E --> F["6. Computer Proofs & 20 Engineering Files"]
+    A["1. Question or Sensor CSV"] --> B["2. Meta Muse 4-Agent Council"]
+    B --> C["3. Physics & Unit Compiler"]
+    C --> D["4. Blind 30%->70% Future Test"]
+    D --> E["5. Zero-Side-Effect Control"]
+    E --> F["6. Proofs + 20 Engineering Files"]
 ```
 
-1. **You ask a question or upload sensor data:** Type any physical, materials, energy, or engineering question into the Web Workbench or CLI—or upload a `.csv` of time-series measurements.
-2. **Equation Compilation & Self-Repair ([`layer3_compiler/`](cortivra/layer3_compiler/symbolic_compiler.py)):** `Muse Wonder` proposes a coupled multi-compartment model. `Muse Spark` and the Layer 3 compiler check that every term has matching SI units, conserves energy, and produces non-negative entropy.
-3. **Blind Future Prediction Test ([`universal_telemetry_hunter.py`](cortivra/layer6_agents/universal_telemetry_hunter.py)):** To prove the engine isn't just curve-fitting, Cortivra trains on only the **first 30%** of the time steps and predicts the **unseen 70% future** blind—comparing its discovered equations head-to-head against standard polynomial curve-fitting.
-4. **Solving Control Without Side Effects ([`intervention_and_control.py`](cortivra/layer4_engine/intervention_and_control.py)):** Cortivra measures how every tunable lever affects the healthy neighboring parts of the system, then projects its control adjustments into the **nullspace** (the mathematical "blind spot" of the neighbors). The main problem is fixed while neighboring parts stay flat inside their safe operating limits—even when the real world drifts by **$\pm 25\%$**.
-5. **Computer-Checked Proofs ([`rigorous_proofs.py`](cortivra/layer1_axioms/rigorous_proofs.py), [`lean4_smt_compiler.py`](cortivra/layer1_axioms/lean4_smt_compiler.py)):** Cortivra proves the controlled system cannot spiral out of control using outward-rounded IEEE-754 interval arithmetic (`math.nextafter`), Sum-of-Squares (SOS) energy decay, and exports machine-checkable **Lean 4** (`formal_theorem.lean`) and **Z3 SMT-LIB2** (`formal_certificate.smt2`) proof scripts.
-6. **3-Stage Physical Realization & 20 Exported Files ([`deliverable_exporter.py`](cortivra/layer6_agents/deliverable_exporter.py)):**
-   * **Stage 1 (Hardware & Firmware):** 3D printable `.stl`/`.obj` multi-vessel CAD meshes, 3-view `.svg` engineering blueprint, and compilable ANSI C99 controller code (`controller_firmware.c`).
-   * **Stage 2 (Manufacturing Recipe):** A 5-compartment reactor simulation that solves for a 4-stage temperature, feed, catalyst, and quench schedule ([`recursive_synthesis_engine.py`](cortivra/layer6_agents/recursive_synthesis_engine.py)).
-   * **Stage 3 (Molecule & 3D Porous Lattice):** Screens 700 candidate molecular building-block combinations to output Top-3 `SMILES` structures + 3D atomic `.xyz` coordinates, paired with a 3D cellular metamaterial lattice ([`pass3_matter_and_lattice_compiler.py`](cortivra/layer6_agents/pass3_matter_and_lattice_compiler.py)).
+1. **Ask a Question or Upload Data:** Type a one-sentence scientific question into the Web Workbench (or CLI), or upload a `.csv` of time-series sensor measurements.
+2. **Build & Verify the Equations ([`layer3_compiler/`](cortivra/layer3_compiler/symbolic_compiler.py)):** `Muse Wonder` proposes a coupled multi-part model. `Muse Spark` and the Layer 3 compiler verify that every term has matching physical units, conserves energy, and never violates thermodynamics.
+3. **Prove It Predicts the Future Blind ([`universal_telemetry_hunter.py`](cortivra/layer6_agents/universal_telemetry_hunter.py)):** To prove the engine found the real physical law instead of just memorizing data, Cortivra trains on only the **first 30%** of the timeline and predicts the **unseen 70% future** blind—beating standard polynomial curve-fitting head-to-head.
+4. **Fix the Target Without Side Effects ([`intervention_and_control.py`](cortivra/layer4_engine/intervention_and_control.py)):** Cortivra maps how every tunable lever affects the healthy neighboring parts, then coordinates multiple levers so the side effects cancel each other out. The main target is fixed while every neighbor stays safely inside its healthy corridor—even when the real world shifts by **$\pm 25\%$**.
+5. **Generate Computer-Checked Math Proofs ([`rigorous_proofs.py`](cortivra/layer1_axioms/rigorous_proofs.py), [`lean4_smt_compiler.py`](cortivra/layer1_axioms/lean4_smt_compiler.py)):** Cortivra proves the system is stable across continuous ranges of values (not just isolated test points) and exports machine-checkable **Lean 4** (`formal_theorem.lean`) and **Z3 SMT-LIB2** (`formal_certificate.smt2`) proof files.
+6. **Compile 3 Stages of Physical Designs & 20 Files ([`deliverable_exporter.py`](cortivra/layer6_agents/deliverable_exporter.py)):**
+   * **Stage 1 (Hardware & Code):** 3D printable `.stl`/`.obj` vessel meshes, 3-view `.svg` engineering blueprint, and compilable ANSI C99 microcontroller code (`controller_firmware.c`).
+   * **Stage 2 (4-Step Lab Recipe):** Simulates a 5-part synthesis reactor to output a 4-stage heating, feed, catalyst, and cooling recipe ([`recursive_synthesis_engine.py`](cortivra/layer6_agents/recursive_synthesis_engine.py)).
+   * **Stage 3 (Molecules & 3D Lattices):** Screens 700 molecular combinations to select the Top-3 candidate molecules (`SMILES` + 3D atomic `.xyz` coordinates) and designs a 3D porous support lattice ([`pass3_matter_and_lattice_compiler.py`](cortivra/layer6_agents/pass3_matter_and_lattice_compiler.py)).
 
 ---
 
-## 3. Judge's Proof Map: Click Any Claim to Inspect the Code
+## 4. Judge's Proof Map: Click Any Claim to Inspect the Code
 
-Every capability in Cortivra was built from scratch during the hackathon window (**Oct 27 – Nov 4, 2026**) in pure Python + PyTorch. Nothing is a mock or static template—click any module below to inspect the math directly:
+Every layer of Cortivra is real, runnable Python and PyTorch code built during the hackathon. Click any link below to inspect the implementation and its automated tests:
 
-| What Cortivra Does | Plain-English Explanation | Exact Code File to Inspect | Verification Test Suite |
+| Capability | What It Does in Plain Terms | Source Code to Inspect | Automated Tests |
 | :--- | :--- | :--- | :--- |
-| **1. 7D SI Unit & Scaling Engine** | Tracks $[\text{kg, m, s, A, K, mol, cd}]$ on every variable and extracts dimensionless scaling ratios ($\text{Da, Pe, Bi}$) via SVD. | [`cortivra/layer1_axioms/units.py`](cortivra/layer1_axioms/units.py)<br>[`buckingham_pi_scaling.py`](cortivra/layer1_axioms/buckingham_pi_scaling.py) | [`tests/test_layer1_axioms.py`](tests/test_layer1_axioms.py) |
-| **2. Physics & Quantum Shields** | Enforces 1st-Law energy balance ($J = -J^\top$), 2nd-Law dissipation ($R \succeq 0$), and GKSL quantum coherence ($T_2 \le 2T_1$). | [`cortivra/layer1_axioms/hamiltonian.py`](cortivra/layer1_axioms/hamiltonian.py)<br>[`cortivra/layer1_axioms/shields.py`](cortivra/layer1_axioms/shields.py) | [`tests/test_layer1_axioms.py`](tests/test_layer1_axioms.py) |
-| **3. Interval, SOS & Lean 4 / SMT-LIB2 Prover** | Bounds continuous state boxes with IEEE-754 outward rounding (`math.nextafter`) and emits `.lean` + `.smt2` proof files. | [`cortivra/layer1_axioms/rigorous_proofs.py`](cortivra/layer1_axioms/rigorous_proofs.py)<br>[`lean4_smt_compiler.py`](cortivra/layer1_axioms/lean4_smt_compiler.py) | [`tests/test_live_observatory_and_skeptic_proofs.py`](tests/test_live_observatory_and_skeptic_proofs.py) |
-| **4. Symbolic AST & 3D PDE Compiler** | Parses math strings into an AST, takes symbolic derivatives $\nabla H$, checks units, and discretizes 1D/2D/3D PDEs. | [`cortivra/layer3_compiler/ast_nodes.py`](cortivra/layer3_compiler/ast_nodes.py)<br>[`symbolic_compiler.py`](cortivra/layer3_compiler/symbolic_compiler.py) | [`tests/test_layer3_compiler.py`](tests/test_layer3_compiler.py) |
-| **5. Zero-Side-Effect Nullspace Control** | Projects parameter updates into the SVD nullspace of bystander sensitivities ($P_\perp = I - V W V^\top$) so neighbors stay safe. | [`cortivra/layer4_engine/intervention_and_control.py`](cortivra/layer4_engine/intervention_and_control.py)<br>[`inverse_solver.py`](cortivra/layer4_engine/inverse_solver.py) | [`tests/test_layer4_engine.py`](tests/test_layer4_engine.py) |
-| **6. Noise-Resistant Equation Discovery** | Uses integration by parts with smooth bump functions so noisy sensor data is never differentiated directly, plus rational Padé laws. | [`cortivra/layer5_discovery/sparse_regression.py`](cortivra/layer5_discovery/sparse_regression.py)<br>[`rational_pade_discovery.py`](cortivra/layer5_discovery/rational_pade_discovery.py) | [`tests/test_layer5_discovery.py`](tests/test_layer5_discovery.py)<br>[`test_nobel_prize_blind_rediscoveries.py`](tests/test_nobel_prize_blind_rediscoveries.py) |
-| **7. 4-Agent Meta Muse Council** | Orchestrates `Muse Wonder`, `Muse Spark`, `Muse Spark Open` (`meta-models/muse-spark-open-1026`), and `Muse Glimmer` across Baseten, Fireworks, and Meta API. | [`cortivra/layer6_agents/meta_clients.py`](cortivra/layer6_agents/meta_clients.py)<br>[`cortivra/layer6_agents/council.py`](cortivra/layer6_agents/council.py) | [`tests/test_layer6_council_and_deliverables.py`](tests/test_layer6_council_and_deliverables.py) |
-| **8. 3-Stage Physical Realization & 20 Files** | Synthesizes 3D `.stl`/`.obj` CAD, `.svg` blueprints, `C99` code, Stage-2 reactor schedules, and Stage-3 `SMILES`/TPMS lattices. | [`blueprint_compiler.py`](cortivra/layer6_agents/blueprint_compiler.py)<br>[`recursive_synthesis_engine.py`](cortivra/layer6_agents/recursive_synthesis_engine.py)<br>[`pass3_matter_and_lattice_compiler.py`](cortivra/layer6_agents/pass3_matter_and_lattice_compiler.py) | [`tests/test_live_end_to_end_verification.py`](tests/test_live_end_to_end_verification.py) |
-| **9. Tamper-Evident Merkle Flight Recorder & UI** | Records every math step into a SHA-256 hash-chained DAG and streams it live to the 6-tab Web Workbench. | [`cortivra/observability/flight_recorder.py`](cortivra/observability/flight_recorder.py)<br>[`cortivra/ui_server.py`](cortivra/ui_server.py) | [`tests/test_observability.py`](tests/test_observability.py)<br>[`test_ui_workbench_server.py`](tests/test_ui_workbench_server.py) |
+| **1. 7D Physical Unit Checker** | Tracks $[\text{kg, m, s, A, K, mol, cd}]$ on every variable so invalid equations are rejected immediately. | [`cortivra/layer1_axioms/units.py`](cortivra/layer1_axioms/units.py)<br>[`buckingham_pi_scaling.py`](cortivra/layer1_axioms/buckingham_pi_scaling.py) | [`tests/test_layer1_axioms.py`](tests/test_layer1_axioms.py) |
+| **2. Energy & Safety Shields** | Guarantees conservation of energy, non-negative heat dissipation, and quantum coherence limits ($T_2 \le 2T_1$). | [`cortivra/layer1_axioms/hamiltonian.py`](cortivra/layer1_axioms/hamiltonian.py)<br>[`cortivra/layer1_axioms/shields.py`](cortivra/layer1_axioms/shields.py) | [`tests/test_layer1_axioms.py`](tests/test_layer1_axioms.py) |
+| **3. Formal Proof Generators** | Uses outward-rounded IEEE-754 interval math (`math.nextafter`), Sum-of-Squares, and exports **Lean 4** & **SMT-LIB2** proofs. | [`cortivra/layer1_axioms/rigorous_proofs.py`](cortivra/layer1_axioms/rigorous_proofs.py)<br>[`lean4_smt_compiler.py`](cortivra/layer1_axioms/lean4_smt_compiler.py) | [`tests/test_live_observatory_and_skeptic_proofs.py`](tests/test_live_observatory_and_skeptic_proofs.py) |
+| **4. Equation & 3D Space Compiler** | Parses math formulas into an AST, takes exact derivatives, and simulates 3D spatial diffusion across a $12\times12\times12$ grid. | [`cortivra/layer3_compiler/ast_nodes.py`](cortivra/layer3_compiler/ast_nodes.py)<br>[`symbolic_compiler.py`](cortivra/layer3_compiler/symbolic_compiler.py) | [`tests/test_layer3_compiler.py`](tests/test_layer3_compiler.py) |
+| **5. Zero-Side-Effect Control Solver** | Uses SVD nullspace projection so tuning levers fixes the target state without disturbing healthy neighbors. | [`cortivra/layer4_engine/intervention_and_control.py`](cortivra/layer4_engine/intervention_and_control.py)<br>[`inverse_solver.py`](cortivra/layer4_engine/inverse_solver.py) | [`tests/test_layer4_engine.py`](tests/test_layer4_engine.py) |
+| **6. Noise-Resistant Law Discovery** | Discovers differential equations and rational laws from noisy data using integration by parts instead of noisy derivatives. | [`cortivra/layer5_discovery/sparse_regression.py`](cortivra/layer5_discovery/sparse_regression.py)<br>[`rational_pade_discovery.py`](cortivra/layer5_discovery/rational_pade_discovery.py) | [`tests/test_layer5_discovery.py`](tests/test_layer5_discovery.py)<br>[`test_nobel_prize_blind_rediscoveries.py`](tests/test_nobel_prize_blind_rediscoveries.py) |
+| **7. 4-Agent Meta Muse Council** | Routes across `Muse Wonder`, `Muse Spark`, `Muse Spark Open` (`meta-models/muse-spark-open-1026`), and `Muse Glimmer`. | [`cortivra/layer6_agents/meta_clients.py`](cortivra/layer6_agents/meta_clients.py)<br>[`cortivra/layer6_agents/council.py`](cortivra/layer6_agents/council.py) | [`tests/test_layer6_council_and_deliverables.py`](tests/test_layer6_council_and_deliverables.py) |
+| **8. 3-Stage Hardware, Recipe & Molecule Compiler** | Generates 3D `.stl`/`.obj` CAD, `.svg` blueprints, `C99` code, 4-stage reactor recipes, and `SMILES` + 3D `.xyz` molecules. | [`blueprint_compiler.py`](cortivra/layer6_agents/blueprint_compiler.py)<br>[`recursive_synthesis_engine.py`](cortivra/layer6_agents/recursive_synthesis_engine.py)<br>[`pass3_matter_and_lattice_compiler.py`](cortivra/layer6_agents/pass3_matter_and_lattice_compiler.py) | [`tests/test_live_end_to_end_verification.py`](tests/test_live_end_to_end_verification.py) |
+| **9. Tamper-Proof Flight Recorder & Web UI** | Chains every step with a SHA-256 Merkle hash and streams live to the interactive 6-tab Web Workbench. | [`cortivra/observability/flight_recorder.py`](cortivra/observability/flight_recorder.py)<br>[`cortivra/ui_server.py`](cortivra/ui_server.py) | [`tests/test_observability.py`](tests/test_observability.py)<br>[`test_ui_workbench_server.py`](tests/test_ui_workbench_server.py) |
 
 ---
 
-## 4. How Cortivra Uses Meta AI Models
+## 5. How Cortivra Uses Meta AI Models
 
-Cortivra uses a **4-Agent Epistemic Council** ([`cortivra/layer6_agents/meta_clients.py`](cortivra/layer6_agents/meta_clients.py)) backed by live multi-provider routing across **Baseten** (`meta-models/muse-spark-open-1026`), **Fireworks AI**, and the **Meta Model API**:
+Cortivra orchestrates a **4-Agent Scientific Council** ([`cortivra/layer6_agents/meta_clients.py`](cortivra/layer6_agents/meta_clients.py)) via live inference on **Baseten** (`meta-models/muse-spark-open-1026`), **Fireworks AI**, and the **Meta Model API**:
 
-| Agent Role | Meta Model / Persona | Exact Job Inside Cortivra |
+| Agent Role | Meta Model / Persona | What It Does in Plain Terms |
 | :--- | :--- | :--- |
-| **`Muse Wonder`** | Theorist & Operator Selector | Formulates coupled N-compartment Port-Hamiltonian world models ($H, J, R, \mathbf{u}$) from natural language and selects the next mathematical operator from Fisher Information spectra. |
-| **`Muse Spark`** | Symbolic Compiler & Self-Repair | Inspects compile-time 7D SI unit errors and 2nd-Law thermodynamic violations to algebraically repair symbolic equations ([`compile_with_self_repair`](cortivra/layer6_agents/hypothesis_compiler.py)). |
-| **`Muse Spark Open`** | `meta-models/muse-spark-open-1026` | Acts as the Popperian red-team falsifier: stress-tests candidate equations and interventions across 4 falsification gates, $4\times$ extended time horizons, and $\pm 30\%$ parameter drift. |
-| **`Muse Glimmer`** | Realization Chronicler & Co-Scientist | Synthesizes the verified math into the executive dossier and powers the interactive **Co-Scientist AI Chat** inside the Web Workbench so anyone can ask questions about any equation, proof, or molecule in plain English. |
+| **`Muse Wonder`** | Theorist & Planner | Translates your question into a coupled multi-part physical model and decides which math tool to run at each step. |
+| **`Muse Spark`** | Equation Compiler & Repair | Reads compiler error messages when units or energy laws don't match and rewrites the symbolic math until it passes every check ([`compile_with_self_repair`](cortivra/layer6_agents/hypothesis_compiler.py)). |
+| **`Muse Spark Open`** | `meta-models/muse-spark-open-1026` | Acts as the red-team skeptic: tries to break the discovered equations and control strategy under noise, $4\times$ longer time horizons, and $\pm 30\%$ real-world drift. |
+| **`Muse Glimmer`** | Chronicler & Co-Scientist | Summarizes the verified findings and powers the built-in **Co-Scientist AI Chat** in the Web Workbench so anyone can click any section and ask questions in plain English. |
 
 ---
 
-## 5. Quick Start (Run in 60 Seconds)
+## 6. Quick Start (Run in 60 Seconds)
 
 ### 1. Install Dependencies
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 2. Configure Your API Key
+### 2. Add Your API Key
 ```bash
 cp .env.example .env
 # Add your BASETEN_API_KEY, FIREWORKS_API_KEY, or META_API_KEY in .env
@@ -97,63 +111,60 @@ cp .env.example .env
 ```bash
 python -m cortivra --ui --port 8765
 ```
-Open `http://127.0.0.1:8765` in your browser to type any question, upload a `.csv` dataset, watch the 6-phase mathematical trace stream live, rotate the 3D CAD and molecular models, ask the Co-Scientist AI questions about any section, and inspect or download all 20 deliverable files.
+Open `http://127.0.0.1:8765` in your browser to type any question, upload a `.csv` dataset, watch the 6-phase step stream live, interact with the 3D CAD and molecular viewers, ask the Co-Scientist AI questions, and inspect or download all 20 generated files.
 
-### 4. Or Run Directly from the Command Line
+### 4. Or Run a 1-Sentence Investigation from the Terminal
 ```bash
 python -m cortivra "Suppress lithium dendrite growth in an argyrodite solid-state battery during fast charging without degrading bulk ionic conductivity or triggering interfacial thermal runaway." --domain electrochemistry --save-logs
 ```
 
-### 5. Run the Verification Test Suite
+### 5. Run the Test Suite
 ```bash
 pytest
 ```
 
 ---
 
-## 6. All 20 Files Exported on Every Run
+## 7. This Is Just the Beginning (A Note from the Builder)
 
-Every investigation saves a SHA-256 hash-chained folder under `logs/runs/<timestamp>_<system_name>/`:
+Everything in this repository—all 6 layers of the physics compiler, the zero-side-effect control solver, the formal proof exporters, the 3-stage realization pipeline, and the interactive Web Workbench—was built solo during the 9-day hackathon window (**Oct 27 – Nov 4, 2026**).
 
-| Category | File Path | What It Contains |
+Halfway through the hackathon over the weekend, I suffered a blood clot in my brain and had to spend a night in the ICU. Hitting a medical emergency like that in the middle of the build was a massive roadblock, and it cut deeply into the time I had left. Even so, I was determined to get Cortivra across the finish line.
+
+What you see here is just the foundation—there is still so much more I want to do with this engine, and I have major plans and upgrades ahead to push Cortivra much further across every branch of science and engineering.
+
+---
+
+## 8. All 20 Files Exported on Every Run
+
+Every investigation exports a tamper-evident, SHA-256 hash-chained folder under `logs/runs/<timestamp>_<system_name>/`:
+
+| Category | File Path | What It Is |
 | :--- | :--- | :--- |
-| **Interactive Reports** | `dossier.html` | Self-contained HTML5 visual command center with interactive 3D CAD & molecular viewers |
-| **Interactive Reports** | `dossier.md` | Complete 9-section scientific discovery dossier, equations, proofs, and scorecard |
-| **Interactive Reports** | `dossier.json` | Full machine-readable JSON telemetry across Layers 1–6 |
-| **Formal Proofs** | `deliverables/formal_theorem.lean` | **Lean 4** formal proof of Port-Hamiltonian passivity, spectral gap, and interval contraction |
-| **Formal Proofs** | `deliverables/formal_certificate.smt2` | **SMT-LIB2 (`QF_NRA`)** nonlinear real arithmetic script for Z3/CVC5 certifying `unsat` (zero counterexamples) |
-| **3D CAD & Matter** | `deliverables/cad_assembly.stl` | Watertight 3D-printable multi-compartment solid mesh (`mm` scale) |
-| **3D CAD & Matter** | `deliverables/cad_assembly.obj` | Wavefront 3D mesh rendered in the interactive Web Workbench viewport |
-| **3D CAD & Matter** | `deliverables/engineering_blueprint.svg` | 3-view orthographic engineering blueprint with dimensional callouts |
-| **3D CAD & Matter** | `deliverables/pass3_molecule.xyz` | 3D atomic coordinates (`Å`) for the Top-1 candidate molecule (`SMILES`) |
-| **3D CAD & Matter** | `deliverables/pass3_structure.svg` | Dual-panel 2D covalent molecular graph & 3D periodic unit-cell lattice diagram |
-| **3D CAD & Matter** | `deliverables/pass3_matter_and_lattice_spec.json` | Top-3 Pareto `SMILES` molecules and 4-topology Gibson-Ashby/TPMS lattice specs |
-| **Runnable Code** | `deliverables/controller_firmware.h` | ANSI C99 header with fixed-cycle state structs, safety macros, and bitmask flags |
-| **Runnable Code** | `deliverables/controller_firmware.c` | Compilable (`gcc -std=c99`) closed-loop passivity controller with built-in self-test |
-| **Runnable Code** | `deliverables/digital_twin_simulator.py` | Standalone Python simulator running RK4 + Langevin noise + $\pm 25\%$ mismatched-reality trial |
-| **SOP & Audit Logs** | `deliverables/wetlab_and_manufacturing_sop.md` | Step-by-step Standard Operating Procedure, Bill of Materials (BOM), and 4-stage reactor recipe |
-| **SOP & Audit Logs** | `deliverables/fmeca_and_bom.json` | Safe Operating Area (SOA), stoichiometric BOM, and Sobol FMECA risk table |
-| **SOP & Audit Logs** | `execution_flight_recorder.log` | Human-readable 8-stage execution walkthrough and causal trace timeline |
-| **SOP & Audit Logs** | `execution_ledger.jsonl` | Structured per-stage pass/fail ledger with SHA-256 deliverable digests |
-| **SOP & Audit Logs** | `flight_recorder.jsonl` | Cryptographic SHA-256 Merkle-chained causal trace nodes and operator spectra |
-| **SOP & Audit Logs** | `deliverables/deliverable_manifest.json` | Master file inventory with byte sizes, SHA-256 hashes, and Merkle root hash |
+| **Interactive Reports** | `dossier.html` | Self-contained HTML5 dashboard with interactive 3D CAD & molecular viewers |
+| **Interactive Reports** | `dossier.md` | Complete 9-section scientific discovery report, equations, proofs, and scorecard |
+| **Interactive Reports** | `dossier.json` | Complete machine-readable JSON output of all metrics and certificates |
+| **Computer Proofs** | `deliverables/formal_theorem.lean` | **Lean 4** formal proof of energy conservation, stability, and interval contraction |
+| **Computer Proofs** | `deliverables/formal_certificate.smt2` | **SMT-LIB2 (`QF_NRA`)** proof script for Z3/CVC5 certifying zero counterexamples (`unsat`) |
+| **3D CAD & Molecules** | `deliverables/cad_assembly.stl` | Watertight 3D-printable multi-compartment hardware mesh (`mm` scale) |
+| **3D CAD & Molecules** | `deliverables/cad_assembly.obj` | Wavefront 3D mesh rendered in the Web Workbench 3D viewport |
+| **3D CAD & Molecules** | `deliverables/engineering_blueprint.svg` | 3-view orthographic engineering blueprint with dimensions |
+| **3D CAD & Molecules** | `deliverables/pass3_molecule.xyz` | 3D atomic coordinates (`Å`) for the Top-1 candidate molecule (`SMILES`) |
+| **3D CAD & Molecules** | `deliverables/pass3_structure.svg` | 2D molecular graph & 3D periodic support lattice diagram |
+| **3D CAD & Molecules** | `deliverables/pass3_matter_and_lattice_spec.json` | Top-3 candidate `SMILES` molecules and 4-topology 3D lattice specs |
+| **Runnable Code** | `deliverables/controller_firmware.h` | ANSI C99 header with state structs, safety limits, and watchdog flags |
+| **Runnable Code** | `deliverables/controller_firmware.c` | Compilable (`gcc -std=c99`) closed-loop controller with built-in self-test |
+| **Runnable Code** | `deliverables/digital_twin_simulator.py` | Standalone Python simulator with thermal noise and $\pm 25\%$ real-world drift test |
+| **Lab Manual & Audit** | `deliverables/wetlab_and_manufacturing_sop.md` | Step-by-step lab manual, Bill of Materials (BOM), and 4-stage reactor recipe |
+| **Lab Manual & Audit** | `deliverables/fmeca_and_bom.json` | Safe Operating Area (SOA), stoichiometric BOM, and risk table |
+| **Lab Manual & Audit** | `execution_flight_recorder.log` | Plain-text 8-stage verification summary and timeline |
+| **Lab Manual & Audit** | `execution_ledger.jsonl` | Per-stage pass/fail ledger with SHA-256 file hashes |
+| **Lab Manual & Audit** | `flight_recorder.jsonl` | SHA-256 Merkle-chained causal trace nodes |
+| **Lab Manual & Audit** | `deliverables/deliverable_manifest.json` | Master file list with byte sizes, SHA-256 digests, and Merkle root hash |
 
 ---
 
-## 7. Roadmap: This Is Just the Beginning
+## 9. License, Security & Intellectual Property
 
-Everything in this repository—all 6 layers, the symbolic compiler, the interval/SOS/Lean 4 provers, the 3-stage realization pipeline, and the Web Workbench—was architected and built during the 9-day hackathon window (**Oct 27 – Nov 4, 2026**).
-
-While Cortivra already closes the loop from a natural-language question to verified differential equations and 20 engineering artifacts in silico, **this is just the foundation**. Here is what comes next:
-
-1. **Direct Hardware-in-the-Loop (HIL) & Lab Robotics Integration:** Connecting the generated ANSI C99 firmware and Stage-2 reactor schedules directly to physical microcontrollers (STM32/ESP32), microfluidic pumps, and automated wet-lab synthesis stations for real-time closed-loop experiments.
-2. **Automated External Prover Kernel Execution:** Wiring `formal_theorem.lean` and `formal_certificate.smt2` directly into live Lean 4 (`lake build`) and Z3/dReal solver binaries inside a continuous verification loop for higher-degree non-polynomial PDEs.
-3. **Full 3D Finite-Element (FEM) & Navier-Stokes Multi-Physics Meshes:** Expanding Layer 3's 3D voxel reaction-diffusion discretizer (`12×12×12` FVM) to unstructured tetrahedral FEM meshes coupled with compressible fluid flow and Maxwell electrodynamics.
-4. **3D De Novo Atomistic Force-Field Relaxation:** Upgrading Stage 3's 700-candidate group-contribution and VSEPR coordinate solver to run GPU-accelerated equivariant neural potentials and DFT single-point energy refinement.
-
----
-
-## 8. License, Security & Intellectual Property
-
-* **Dual License ([`LICENSE`](LICENSE)):** Released under the **GNU Affero General Public License v3.0 (AGPL-3.0)** for open-source academic and hackathon evaluation (requiring full source disclosure for any network/SaaS deployment under Section 13), with all commercial, closed-source, and enterprise rights reserved by the author (Brad Harris).
-* **Security & Provenance ([`SECURITY.md`](SECURITY.md)):** Zero credentials in source code, strict localhost and path-traversal sandboxing on the Web Workbench, and SHA-256 Merkle provenance on all generated artifacts.
+* **Dual License ([`LICENSE`](LICENSE)):** Available under the **GNU Affero General Public License v3.0 (AGPL-3.0)** for open-source academic and hackathon evaluation (requiring full source disclosure for any network or hosted deployment under Section 13), with all commercial, closed-source, and enterprise rights reserved by the author (Brad Harris).
+* **Security & Provenance ([`SECURITY.md`](SECURITY.md)):** Zero credentials in source code, strict localhost and path-traversal protection on the Web Workbench, and SHA-256 Merkle provenance on every generated file.
